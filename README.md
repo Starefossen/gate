@@ -1,5 +1,7 @@
 # Gate
 
+![Gate](assets/gate-hero.png)
+
 Kubernetes-native L4 gateway that selectively exposes Knative services to the
 internet. Sits in front of Kourier (Envoy) and filters traffic based on TLS SNI
 and HTTP Host headers against a dynamic allowlist built from Knative Service
