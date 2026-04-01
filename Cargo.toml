@@ -1,0 +1,21 @@
+[package]
+name = "gate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kube = { version = "1", features = ["runtime", "client"] }
+k8s-openapi = { version = "0.25", features = ["v1_32"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+futures = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+serde_json = "1.0.149"

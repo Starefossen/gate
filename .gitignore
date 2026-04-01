@@ -1,0 +1,6 @@
+/target/
+/binaries/
+.build-tag
+*.swp
+*.swo
+*~

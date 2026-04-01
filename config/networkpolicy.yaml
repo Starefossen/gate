@@ -1,0 +1,54 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gate
+  namespace: gate
+spec:
+  endpointSelector:
+    matchLabels:
+      app: gate
+  ingress:
+    # Allow inbound traffic on proxy ports only
+    - fromEntities:
+        - world
+        - cluster
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            - port: "8443"
+              protocol: TCP
+            - port: "9090"
+              protocol: TCP
+  egress:
+    # Allow traffic to Kourier/Envoy (upstream)
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kourier-system
+            app: 3scale-kourier-gateway
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+            - port: "8443"
+              protocol: TCP
+    # Allow traffic to Kubernetes API server (controller watches)
+    - toEntities:
+        - host
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "6443"
+              protocol: TCP
+    # Allow DNS
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP

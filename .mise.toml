@@ -1,0 +1,91 @@
+[tools]
+zig = "latest"
+
+[env]
+APP_NAME = "gate"
+REGISTRY_URL = "registry.intern.flaatten.org:5000"
+
+[tasks.build]
+description = "Build binaries and Docker image"
+run = """
+  mkdir -p binaries
+
+  echo "Building linux/amd64..."
+  cargo zigbuild --release --target x86_64-unknown-linux-gnu
+  cp target/x86_64-unknown-linux-gnu/release/gate binaries/gate-linux-amd64
+
+  BUILD_TAG=$(date +%s)
+  IMAGE="${REGISTRY_URL}/${APP_NAME}"
+  echo "Building ${IMAGE}:${BUILD_TAG}..."
+  docker buildx build \
+    --platform linux/amd64 \
+    -t ${IMAGE}:${BUILD_TAG} \
+    -t ${IMAGE}:latest \
+    --push \
+    .
+  echo "${BUILD_TAG}" > .build-tag
+  echo "Built and pushed: ${IMAGE}:${BUILD_TAG}"
+"""
+
+[tasks.deploy]
+description = "Deploy to Kubernetes"
+run = """
+  BUILD_TAG=$(cat .build-tag 2>/dev/null || echo "latest")
+  IMAGE="${REGISTRY_URL}/${APP_NAME}:${BUILD_TAG}"
+  echo "Deploying ${APP_NAME} with image ${IMAGE}..."
+  sed "s|image:.*gate.*|image: ${IMAGE}|g" config/deployment.yaml | kubectl apply -f -
+  kubectl apply -f config/networkpolicy.yaml
+  kubectl rollout status deployment/gate -n gate --timeout=120s
+  echo "Deployed successfully"
+"""
+
+[tasks.full-deploy]
+description = "Build and deploy"
+run = """
+  mise run build
+  mise run deploy
+"""
+
+[tasks.redeploy]
+description = "Force redeploy (delete + deploy)"
+run = """
+  mise run build
+  kubectl delete deployment gate -n gate --ignore-not-found
+  mise run deploy
+"""
+
+[tasks.status]
+description = "Show deployment status"
+run = """
+  echo "=== Deployment ==="
+  kubectl get deployment gate -n gate -o wide 2>/dev/null || echo "Not deployed"
+  echo ""
+  echo "=== Pods ==="
+  kubectl get pods -n gate -l app=gate -o wide 2>/dev/null || echo "No pods"
+  echo ""
+  echo "=== Service ==="
+  kubectl get svc gate -n gate -o wide 2>/dev/null || echo "No service"
+"""
+
+[tasks.logs]
+description = "Show service logs"
+run = "kubectl logs -n gate -l app=gate --tail=100 -f"
+
+[tasks.delete]
+description = "Delete all gate resources"
+run = """
+  kubectl delete -f config/deployment.yaml --ignore-not-found
+  kubectl delete -f config/networkpolicy.yaml --ignore-not-found
+"""
+
+[tasks.test]
+description = "Run unit tests"
+run = "cargo test"
+
+[tasks.check]
+description = "Run cargo check"
+run = "cargo check"
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "rm -rf target/ binaries/ .build-tag"

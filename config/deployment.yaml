@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gate
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gate
+  namespace: gate
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gate
+rules:
+  - apiGroups: ["serving.knative.dev"]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gate
+subjects:
+  - kind: ServiceAccount
+    name: gate
+    namespace: gate
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gate
+  namespace: gate
+  labels:
+    app: gate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gate
+  template:
+    metadata:
+      labels:
+        app: gate
+    spec:
+      serviceAccountName: gate
+      containers:
+        - name: gate
+          image: registry.intern.flaatten.org:5000/gate:IMAGE_TAG
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: tls
+              containerPort: 8443
+            - name: health
+              containerPort: 9090
+          env:
+            - name: UPSTREAM_HOST
+              value: "kourier.kourier-system.svc"
+            - name: RUST_LOG
+              value: "gate=info"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "10m"
+            limits:
+              memory: "64Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gate
+  namespace: gate
+  annotations:
+    metallb.io/address-pool: external
+spec:
+  type: LoadBalancer
+  selector:
+    app: gate
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+    - name: https
+      port: 443
+      targetPort: 8443
