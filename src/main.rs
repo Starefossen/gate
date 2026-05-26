@@ -28,19 +28,10 @@ async fn main() {
         tls_listen, http_listen, health_listen, "starting gate"
     );
 
-    let tls_proxy = proxy::run_tls_proxy(
-        tls_listen,
-        upstream_host.clone(),
-        443,
-        allowlist.clone(),
-    );
+    let tls_proxy = proxy::run_tls_proxy(tls_listen, upstream_host.clone(), 443, allowlist.clone());
 
-    let http_proxy = proxy::run_http_proxy(
-        http_listen,
-        upstream_host.clone(),
-        80,
-        allowlist.clone(),
-    );
+    let http_proxy =
+        proxy::run_http_proxy(http_listen, upstream_host.clone(), 80, allowlist.clone());
 
     let health = proxy::run_health_server(health_listen);
 

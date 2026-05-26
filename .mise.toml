@@ -82,9 +82,17 @@ run = """
 description = "Run unit tests"
 run = "cargo test"
 
+[tasks.fix]
+description = "Run all auto-fixers (fmt)"
+run = "cargo fmt"
+
+[tasks.outdated]
+description = "Check for outdated dependencies"
+run = "cargo update --dry-run"
+
 [tasks.check]
-description = "Run cargo check"
-run = "cargo check"
+description = "Run all quality checks (test, fmt)"
+run = "cargo test && cargo fmt --check"
 
 [tasks.clean]
 description = "Clean build artifacts"

@@ -66,7 +66,11 @@ async fn handle_tls_connection(
     debug!(sni = sni_name, upstream_host, "forwarding tls connection");
 
     let mut upstream = TcpStream::connect((upstream_host, upstream_port)).await?;
-    let _ = timeout(PROXY_TIMEOUT, copy_bidirectional(&mut inbound, &mut upstream)).await;
+    let _ = timeout(
+        PROXY_TIMEOUT,
+        copy_bidirectional(&mut inbound, &mut upstream),
+    )
+    .await;
 
     Ok(())
 }
@@ -109,7 +113,8 @@ async fn handle_http_connection(
     let host = match extract_http_host(&buf[..n]) {
         Some(h) => h,
         None => {
-            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response =
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             inbound.write_all(response).await?;
             return Ok(());
         }
@@ -119,7 +124,8 @@ async fn handle_http_connection(
         let allowed = allowlist.read().await;
         if !allowed.contains(&host) {
             debug!(host, "domain not in allowlist, rejecting");
-            let response = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response =
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             inbound.write_all(response).await?;
             return Ok(());
         }
@@ -128,7 +134,11 @@ async fn handle_http_connection(
     debug!(host, upstream_host, "forwarding http connection");
 
     let mut upstream = TcpStream::connect((upstream_host, upstream_port)).await?;
-    let _ = timeout(PROXY_TIMEOUT, copy_bidirectional(&mut inbound, &mut upstream)).await;
+    let _ = timeout(
+        PROXY_TIMEOUT,
+        copy_bidirectional(&mut inbound, &mut upstream),
+    )
+    .await;
 
     Ok(())
 }

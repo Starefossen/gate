@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use futures::TryStreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
-use kube::runtime::{watcher, WatchStreamExt};
+use kube::runtime::{WatchStreamExt, watcher};
 use tracing::{debug, info, warn};
 
 use crate::Allowlist;
@@ -96,7 +96,12 @@ pub async fn run(allowlist: Allowlist) -> Result<(), Box<dyn std::error::Error>>
             }
             Action::Remove(host) => {
                 current_hosts.remove(&host);
-                info!(service = name, namespace = ns, host, "removing from allowlist");
+                info!(
+                    service = name,
+                    namespace = ns,
+                    host,
+                    "removing from allowlist"
+                );
                 rebuild_allowlist(&allowlist, &current_hosts).await;
             }
             Action::NoStatusUrl => {
@@ -190,7 +195,12 @@ mod tests {
 
     #[test]
     fn test_extract_hostname_https() {
-        let svc = make_service("hello", "ns", None, Some("https://hello.ns.fn.flaatten.org"));
+        let svc = make_service(
+            "hello",
+            "ns",
+            None,
+            Some("https://hello.ns.fn.flaatten.org"),
+        );
         assert_eq!(
             extract_hostname(&svc),
             Some("hello.ns.fn.flaatten.org".into())
@@ -208,7 +218,12 @@ mod tests {
 
     #[test]
     fn test_extract_hostname_trailing_slash() {
-        let svc = make_service("hello", "ns", None, Some("https://hello.ns.fn.flaatten.org/"));
+        let svc = make_service(
+            "hello",
+            "ns",
+            None,
+            Some("https://hello.ns.fn.flaatten.org/"),
+        );
         assert_eq!(
             extract_hostname(&svc),
             Some("hello.ns.fn.flaatten.org".into())
@@ -286,10 +301,7 @@ mod tests {
     #[test]
     fn test_process_service_exposed_no_url() {
         let svc = make_service("hello", "ns", expose_annotation(), None);
-        assert_eq!(
-            process_service(&svc, &HashSet::new()),
-            Action::NoStatusUrl
-        );
+        assert_eq!(process_service(&svc, &HashSet::new()), Action::NoStatusUrl);
     }
 
     #[test]
