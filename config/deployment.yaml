@@ -96,7 +96,7 @@ metadata:
   name: gate
   namespace: gate
   annotations:
-    metallb.io/address-pool: external
+    io.cilium/lb-ipam-ips: "192.168.40.60"
 spec:
   type: LoadBalancer
   selector:
