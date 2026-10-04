@@ -17,6 +17,7 @@ run = """
   BUILD_TAG=$(date +%s)
   IMAGE="${REGISTRY_URL}/${APP_NAME}"
   echo "Building ${IMAGE}:${BUILD_TAG}..."
+  ../../scripts/registry-login.sh
   docker buildx build \
     --platform linux/amd64 \
     -t ${IMAGE}:${BUILD_TAG} \
