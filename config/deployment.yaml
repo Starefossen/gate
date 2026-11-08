@@ -99,7 +99,6 @@ metadata:
     io.cilium/lb-ipam-ips: "192.168.40.60"
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Local
   selector:
     app: gate
   ports:

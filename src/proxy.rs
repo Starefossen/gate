@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::Allowlist;
 use crate::sni;
@@ -81,7 +81,7 @@ pub async fn run_tls_proxy(
     loop {
         let (stream, peer) = listener.accept().await?;
         let Some(permit) = limiter.try_acquire(peer.ip()) else {
-            debug!(peer = %peer, "connection limit reached, dropping");
+            warn!(peer = %peer, "connection limit reached, dropping");
             continue;
         };
         let upstream_host = upstream_host.clone();
@@ -151,7 +151,7 @@ pub async fn run_http_redirect(
     loop {
         let (stream, peer) = listener.accept().await?;
         let Some(permit) = limiter.try_acquire(peer.ip()) else {
-            debug!(peer = %peer, "connection limit reached, dropping");
+            warn!(peer = %peer, "connection limit reached, dropping");
             continue;
         };
         let allowlist = allowlist.clone();

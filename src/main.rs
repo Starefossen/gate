@@ -29,8 +29,8 @@ async fn main() {
     );
 
     let limiter = proxy::ConnLimiter::new(
-        env_usize("MAX_CONN", 1024),
-        env_usize("MAX_CONN_PER_IP", 50),
+        env_usize("MAX_CONN", 1024).clamp(1, 65_536),
+        env_usize("MAX_CONN_PER_IP", 50).max(1),
     );
 
     let tls_proxy = proxy::run_tls_proxy(
