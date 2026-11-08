@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
@@ -90,7 +90,7 @@ pub async fn run_tls_proxy(
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(e) =
-                handle_tls_connection(stream, &upstream_host, upstream_port, &allowlist).await
+                handle_tls_connection(stream, peer, &upstream_host, upstream_port, &allowlist).await
             {
                 debug!(peer = %peer, error = %e, "tls connection error");
             }
@@ -100,6 +100,7 @@ pub async fn run_tls_proxy(
 
 async fn handle_tls_connection(
     mut inbound: TcpStream,
+    peer: SocketAddr,
     upstream_host: &str,
     upstream_port: u16,
     allowlist: &Allowlist,
@@ -112,7 +113,7 @@ async fn handle_tls_connection(
     let sni_name = match sni::extract_sni(&buf[..n]) {
         Some(name) => name,
         None => {
-            debug!("no sni found in client hello");
+            debug!(peer = %peer, "no sni found in client hello");
             return Ok(());
         }
     };
@@ -120,12 +121,12 @@ async fn handle_tls_connection(
     {
         let allowed = allowlist.read().await;
         if !allowed.contains(&sni_name) {
-            debug!(sni = sni_name, "domain not in allowlist, rejecting");
+            debug!(peer = %peer, sni = sni_name, "domain not in allowlist, rejecting");
             return Ok(());
         }
     }
 
-    debug!(sni = sni_name, upstream_host, "forwarding tls connection");
+    debug!(peer = %peer, sni = sni_name, upstream_host, "forwarding tls connection");
 
     let mut upstream = TcpStream::connect((upstream_host, upstream_port)).await?;
     let _ = timeout(
@@ -365,9 +366,10 @@ mod tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
             let _ = handle_tls_connection(
                 stream,
+                peer,
                 &upstream_addr.ip().to_string(),
                 upstream_addr.port(),
                 &allowlist,
@@ -392,8 +394,8 @@ mod tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_tls_connection(stream, "127.0.0.1", 1, &allowlist).await;
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_tls_connection(stream, peer, "127.0.0.1", 1, &allowlist).await;
         });
 
         let hello = crate::sni::tests::build_client_hello("evil.example.com", &[]);
@@ -416,8 +418,8 @@ mod tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_tls_connection(stream, "127.0.0.1", 1, &allowlist).await;
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_tls_connection(stream, peer, "127.0.0.1", 1, &allowlist).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
