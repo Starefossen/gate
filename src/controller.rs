@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures::TryStreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
@@ -33,37 +33,70 @@ fn extract_hostname(svc: &DynamicObject) -> Option<String> {
         })
 }
 
-/// Result of processing a Knative Service event.
-#[derive(Debug, PartialEq)]
-enum Action {
-    Add(String),
-    Remove(String),
-    NoStatusUrl,
-    Skip,
+/// Exposed services keyed by namespace/name. The allowlist is derived from
+/// the values, so a delete or de-annotation drops the host immediately.
+#[derive(Default)]
+struct State {
+    hosts: HashMap<String, String>,
+    pending: Option<HashMap<String, String>>,
 }
 
-/// Determine what action to take for a given service event.
-fn process_service(svc: &DynamicObject, current_hosts: &HashSet<String>) -> Action {
-    let exposed = is_exposed(svc);
-    let hostname = extract_hostname(svc);
+fn key(svc: &DynamicObject) -> String {
+    format!(
+        "{}/{}",
+        svc.metadata.namespace.as_deref().unwrap_or(""),
+        svc.metadata.name.as_deref().unwrap_or("")
+    )
+}
 
-    match (exposed, hostname) {
-        (true, Some(host)) => {
-            if !current_hosts.contains(&host) {
-                Action::Add(host)
-            } else {
-                Action::Skip
+fn exposed_host(svc: &DynamicObject) -> Option<String> {
+    if !is_exposed(svc) {
+        return None;
+    }
+    let host = extract_hostname(svc);
+    if host.is_none() {
+        warn!(
+            service = key(svc),
+            "service has expose annotation but no status URL yet"
+        );
+    }
+    host
+}
+
+impl State {
+    /// Applies a watch event; returns true if the host set may have changed.
+    fn apply(&mut self, event: watcher::Event<DynamicObject>) -> bool {
+        match event {
+            watcher::Event::Apply(svc) => {
+                let k = key(&svc);
+                match exposed_host(&svc) {
+                    Some(h) => self.hosts.insert(k, h.clone()) != Some(h),
+                    None => self.hosts.remove(&k).is_some(),
+                }
             }
-        }
-        (false, Some(host)) => {
-            if current_hosts.contains(&host) {
-                Action::Remove(host)
-            } else {
-                Action::Skip
+            watcher::Event::Delete(svc) => self.hosts.remove(&key(&svc)).is_some(),
+            watcher::Event::Init => {
+                self.pending = Some(HashMap::new());
+                false
             }
+            watcher::Event::InitApply(svc) => {
+                if let (Some(p), Some(h)) = (self.pending.as_mut(), exposed_host(&svc)) {
+                    p.insert(key(&svc), h);
+                }
+                false
+            }
+            watcher::Event::InitDone => match self.pending.take() {
+                Some(p) => {
+                    self.hosts = p;
+                    true
+                }
+                None => false,
+            },
         }
-        (true, None) => Action::NoStatusUrl,
-        _ => Action::Skip,
+    }
+
+    fn host_set(&self) -> HashSet<String> {
+        self.hosts.values().cloned().collect()
     }
 }
 
@@ -76,54 +109,25 @@ pub async fn run(allowlist: Allowlist) -> Result<(), Box<dyn std::error::Error>>
 
     info!("watching Knative Services for gate.flaatten.org/expose annotation");
 
-    let stream = watcher(api, watcher::Config::default())
-        .applied_objects()
-        .default_backoff();
-
+    let stream = watcher(api, watcher::Config::default()).default_backoff();
     tokio::pin!(stream);
 
-    let mut current_hosts: HashSet<String> = HashSet::new();
+    let mut state = State::default();
 
-    while let Some(svc) = stream.try_next().await? {
-        let name = svc.metadata.name.as_deref().unwrap_or("unknown");
-        let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
-
-        match process_service(&svc, &current_hosts) {
-            Action::Add(host) => {
-                current_hosts.insert(host.clone());
-                info!(service = name, namespace = ns, host, "adding to allowlist");
-                rebuild_allowlist(&allowlist, &current_hosts).await;
+    while let Some(event) = stream.try_next().await? {
+        if state.apply(event) {
+            let hosts = state.host_set();
+            let mut guard = allowlist.write().await;
+            if *guard != hosts {
+                *guard = hosts;
+                info!(count = guard.len(), hosts = ?*guard, "allowlist updated");
             }
-            Action::Remove(host) => {
-                current_hosts.remove(&host);
-                info!(
-                    service = name,
-                    namespace = ns,
-                    host,
-                    "removing from allowlist"
-                );
-                rebuild_allowlist(&allowlist, &current_hosts).await;
-            }
-            Action::NoStatusUrl => {
-                warn!(
-                    service = name,
-                    namespace = ns,
-                    "service has expose annotation but no status URL yet"
-                );
-            }
-            Action::Skip => {
-                debug!(service = name, namespace = ns, "service not exposed");
-            }
+        } else {
+            debug!("watch event, allowlist unchanged");
         }
     }
 
     Ok(())
-}
-
-async fn rebuild_allowlist(allowlist: &Allowlist, hosts: &HashSet<String>) {
-    let mut guard = allowlist.write().await;
-    *guard = hosts.clone();
-    info!(count = guard.len(), hosts = ?*guard, "allowlist updated");
 }
 
 #[cfg(test)]
@@ -242,71 +246,77 @@ mod tests {
         assert_eq!(extract_hostname(&svc), None);
     }
 
-    #[test]
-    fn test_process_service_add() {
-        let svc = make_service(
-            "hello",
-            "ns",
-            expose_annotation(),
-            Some("https://hello.ns.fn.flaatten.org"),
-        );
-        let hosts = HashSet::new();
-        assert_eq!(
-            process_service(&svc, &hosts),
-            Action::Add("hello.ns.fn.flaatten.org".into())
-        );
+    const URL: &str = "https://hello.ns.fn.flaatten.org";
+    const HOST: &str = "hello.ns.fn.flaatten.org";
+
+    fn exposed() -> DynamicObject {
+        make_service("hello", "ns", expose_annotation(), Some(URL))
     }
 
     #[test]
-    fn test_process_service_already_added() {
-        let svc = make_service(
-            "hello",
-            "ns",
-            expose_annotation(),
-            Some("https://hello.ns.fn.flaatten.org"),
-        );
-        let mut hosts = HashSet::new();
-        hosts.insert("hello.ns.fn.flaatten.org".into());
-        assert_eq!(process_service(&svc, &hosts), Action::Skip);
-    }
-
-    #[test]
-    fn test_process_service_remove() {
-        let svc = make_service(
+    fn apply_adds_and_deannotation_removes() {
+        let mut st = State::default();
+        assert!(st.apply(watcher::Event::Apply(exposed())));
+        assert!(st.host_set().contains(HOST));
+        assert!(!st.apply(watcher::Event::Apply(exposed())));
+        assert!(st.apply(watcher::Event::Apply(make_service(
             "hello",
             "ns",
             None,
-            Some("https://hello.ns.fn.flaatten.org"),
-        );
-        let mut hosts = HashSet::new();
-        hosts.insert("hello.ns.fn.flaatten.org".into());
-        assert_eq!(
-            process_service(&svc, &hosts),
-            Action::Remove("hello.ns.fn.flaatten.org".into())
-        );
+            Some(URL)
+        ))));
+        assert!(st.host_set().is_empty());
     }
 
     #[test]
-    fn test_process_service_not_exposed_not_in_list() {
-        let svc = make_service(
+    fn delete_removes() {
+        let mut st = State::default();
+        st.apply(watcher::Event::Apply(exposed()));
+        assert!(st.apply(watcher::Event::Delete(exposed())));
+        assert!(st.host_set().is_empty());
+    }
+
+    #[test]
+    fn relist_drops_services_deleted_while_disconnected() {
+        let mut st = State::default();
+        st.apply(watcher::Event::Apply(exposed()));
+        st.apply(watcher::Event::Init);
+        st.apply(watcher::Event::InitApply(make_service(
+            "other",
+            "ns",
+            expose_annotation(),
+            Some("https://other.ns.fn.flaatten.org"),
+        )));
+        assert!(st.host_set().contains(HOST), "old set kept until InitDone");
+        assert!(st.apply(watcher::Event::InitDone));
+        let hosts = st.host_set();
+        assert_eq!(hosts.len(), 1);
+        assert!(hosts.contains("other.ns.fn.flaatten.org"));
+    }
+
+    #[test]
+    fn exposed_without_url_is_not_added() {
+        let mut st = State::default();
+        st.apply(watcher::Event::Apply(make_service(
             "hello",
             "ns",
+            expose_annotation(),
             None,
-            Some("https://hello.ns.fn.flaatten.org"),
-        );
-        let hosts = HashSet::new();
-        assert_eq!(process_service(&svc, &hosts), Action::Skip);
+        )));
+        assert!(st.host_set().is_empty());
     }
 
     #[test]
-    fn test_process_service_exposed_no_url() {
-        let svc = make_service("hello", "ns", expose_annotation(), None);
-        assert_eq!(process_service(&svc, &HashSet::new()), Action::NoStatusUrl);
-    }
-
-    #[test]
-    fn test_process_service_no_annotation_no_url() {
-        let svc = make_service("hello", "ns", None, None);
-        assert_eq!(process_service(&svc, &HashSet::new()), Action::Skip);
+    fn shared_host_survives_one_removal() {
+        let mut st = State::default();
+        st.apply(watcher::Event::Apply(exposed()));
+        st.apply(watcher::Event::Apply(make_service(
+            "dup",
+            "ns",
+            expose_annotation(),
+            Some(URL),
+        )));
+        st.apply(watcher::Event::Delete(exposed()));
+        assert!(st.host_set().contains(HOST));
     }
 }

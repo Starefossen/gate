@@ -28,10 +28,20 @@ async fn main() {
         tls_listen, http_listen, health_listen, "starting gate"
     );
 
-    let tls_proxy = proxy::run_tls_proxy(tls_listen, upstream_host.clone(), 443, allowlist.clone());
+    let limiter = proxy::ConnLimiter::new(
+        env_usize("MAX_CONN", 1024),
+        env_usize("MAX_CONN_PER_IP", 50),
+    );
 
-    let http_proxy =
-        proxy::run_http_proxy(http_listen, upstream_host.clone(), 80, allowlist.clone());
+    let tls_proxy = proxy::run_tls_proxy(
+        tls_listen,
+        upstream_host.clone(),
+        443,
+        allowlist.clone(),
+        limiter.clone(),
+    );
+
+    let http_proxy = proxy::run_http_redirect(http_listen, allowlist.clone(), limiter);
 
     let health = proxy::run_health_server(health_listen);
 
@@ -43,4 +53,11 @@ async fn main() {
         r = health => { if let Err(e) = r { tracing::error!(error = %e, "health server exited"); } }
         r = controller => { if let Err(e) = r { tracing::error!(error = ?e, "controller exited"); } }
     }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }

@@ -23,7 +23,7 @@ Internet → [Gate :443/:80] → [Kourier/Envoy] → [Knative Service]
    allowlist
 3. Incoming TLS connections: SNI is extracted from the ClientHello and checked
    against the allowlist before forwarding to Kourier
-4. Incoming HTTP connections: the Host header is checked before forwarding
+4. Incoming HTTP connections are never forwarded: allowlisted hosts get a 301 to `https://<host><path>`
 5. Non-matching traffic is silently dropped (TLS) or rejected with 403 (HTTP)
 
 No TLS termination — gate operates at L4 and passes through encrypted traffic
@@ -35,7 +35,9 @@ unchanged.
 | --------------- | ---------------------------- | ----------------------------- |
 | `UPSTREAM_HOST` | `kourier.kourier-system.svc` | Backend to forward traffic to |
 | `TLS_LISTEN`    | `0.0.0.0:8443`               | TLS proxy listen address      |
-| `HTTP_LISTEN`   | `0.0.0.0:8080`               | HTTP proxy listen address     |
+| `HTTP_LISTEN`   | `0.0.0.0:8080`               | HTTP redirect listen address  |
+| `MAX_CONN`      | `1024`                       | Global concurrent connection cap |
+| `MAX_CONN_PER_IP` | `50`                       | Per-client-IP concurrent connection cap |
 | `HEALTH_LISTEN` | `0.0.0.0:9090`               | Health check endpoint         |
 | `RUST_LOG`      | `gate=info`                  | Log level filter              |
 
