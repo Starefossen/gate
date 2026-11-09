@@ -330,4 +330,26 @@ mod tests {
         st.apply(watcher::Event::Delete(exposed()));
         assert!(st.host_set().contains(HOST));
     }
+
+    #[test]
+    fn same_key_in_separate_states_does_not_collide() {
+        let mut services = State::default();
+        let mut mappings = State::default();
+        services.apply(watcher::Event::Apply(exposed()));
+        mappings.apply(watcher::Event::Apply(make_service(
+            "hello",
+            "ns",
+            expose_annotation(),
+            Some("https://blog.example.org"),
+        )));
+        let union = |a: &State, b: &State| -> HashSet<String> {
+            [a, b].into_iter().flat_map(State::host_set).collect()
+        };
+        assert_eq!(union(&services, &mappings).len(), 2);
+        mappings.apply(watcher::Event::Delete(exposed()));
+        assert_eq!(
+            union(&services, &mappings),
+            HashSet::from([HOST.to_string()])
+        );
+    }
 }
