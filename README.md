@@ -17,9 +17,10 @@ Internet → [Gate :443/:80] → [Kourier/Envoy] → [Knative Service]
         Service annotations
 ```
 
-1. Gate watches all Knative Services for the `gate.flaatten.org/expose: "true"`
-   annotation
-2. Annotated services have their hostname (from `.status.url`) added to the
+1. Gate watches all Knative Services and DomainMappings for the
+   `gate.flaatten.org/expose: "true"` annotation. A DomainMapping needs its own
+   annotation; exposing the target Service does not expose its custom domains
+2. Annotated objects have their hostname (from `.status.url`) added to the
    allowlist
 3. Incoming TLS connections: SNI is extracted from the ClientHello and checked
    against the allowlist before forwarding to Kourier
@@ -98,7 +99,7 @@ src/
 ├── lib.rs          # Crate root — shared Allowlist type, module declarations
 ├── sni.rs          # TLS ClientHello parser — extracts SNI hostname
 ├── proxy.rs        # TCP proxy (TLS + HTTP) and health server
-└── controller.rs   # Knative Service watcher — builds allowlist from annotations
+└── controller.rs   # Knative Service/DomainMapping watcher — builds allowlist from annotations
 ```
 
 - **Pure Rust, zero C dependencies** — builds on distroless base image

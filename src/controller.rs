@@ -100,23 +100,34 @@ impl State {
     }
 }
 
+fn watch(
+    client: kube::Client,
+    kind: &str,
+    version: &str,
+) -> impl futures::Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>> {
+    let gvk = GroupVersionKind::gvk("serving.knative.dev", version, kind);
+    let api: Api<DynamicObject> = Api::all_with(client, &ApiResource::from_gvk(&gvk));
+    watcher(api, watcher::Config::default()).default_backoff()
+}
+
+/// Watches Knative Services and DomainMappings. A DomainMapping must carry
+/// the expose annotation itself: exposing a Service does not expose the
+/// custom domains that point at it.
 pub async fn run(allowlist: Allowlist) -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
 
-    let gvk = GroupVersionKind::gvk("serving.knative.dev", "v1", "Service");
-    let ar = ApiResource::from_gvk(&gvk);
-    let api: Api<DynamicObject> = Api::all_with(client, &ar);
+    info!("watching Knative Services and DomainMappings for gate.flaatten.org/expose annotation");
 
-    info!("watching Knative Services for gate.flaatten.org/expose annotation");
-
-    let stream = watcher(api, watcher::Config::default()).default_backoff();
+    let services = watch(client.clone(), "Service", "v1").map_ok(|e| (0, e));
+    let mappings = watch(client, "DomainMapping", "v1beta1").map_ok(|e| (1, e));
+    let stream = futures::stream::select(services, mappings);
     tokio::pin!(stream);
 
-    let mut state = State::default();
+    let mut states = [State::default(), State::default()];
 
-    while let Some(event) = stream.try_next().await? {
-        if state.apply(event) {
-            let hosts = state.host_set();
+    while let Some((i, event)) = stream.try_next().await? {
+        if states[i].apply(event) {
+            let hosts: HashSet<String> = states.iter().flat_map(State::host_set).collect();
             let mut guard = allowlist.write().await;
             if *guard != hosts {
                 *guard = hosts;
