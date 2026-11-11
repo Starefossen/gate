@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -10,7 +12,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode, header};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
@@ -32,6 +34,7 @@ pub struct ProxyOptions {
     pub header_read_timeout: Duration,
     pub h2_keep_alive_interval: Duration,
     pub h2_keep_alive_timeout: Duration,
+    pub tunnel_idle_timeout: Duration,
 }
 
 impl Default for ProxyOptions {
@@ -42,7 +45,60 @@ impl Default for ProxyOptions {
             header_read_timeout: Duration::from_secs(15),
             h2_keep_alive_interval: Duration::from_secs(30),
             h2_keep_alive_timeout: Duration::from_secs(10),
+            tunnel_idle_timeout: Duration::from_secs(10 * 60),
         }
+    }
+}
+
+struct ActivityStream<T> {
+    inner: T,
+    tx: tokio::sync::mpsc::Sender<()>,
+}
+
+impl<T> ActivityStream<T> {
+    fn new(inner: T, tx: tokio::sync::mpsc::Sender<()>) -> Self {
+        Self { inner, tx }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityStream<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res
+            && buf.filled().len() > before
+        {
+            let _ = self.tx.try_send(());
+        }
+        res
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityStream<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res
+            && *n > 0
+        {
+            let _ = self.tx.try_send(());
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -191,7 +247,6 @@ pub async fn run_tls_proxy_with_options(
         let options = options.clone();
 
         tokio::spawn(async move {
-            let _permit = permit;
             if let Err(e) = handle_tls_connection(
                 stream,
                 peer,
@@ -199,6 +254,7 @@ pub async fn run_tls_proxy_with_options(
                 allowlist,
                 upstream_client,
                 options,
+                permit,
             )
             .await
             {
@@ -215,7 +271,9 @@ async fn handle_tls_connection(
     allowlist: Allowlist,
     upstream_client: ClientType<Incoming>,
     options: ProxyOptions,
+    permit: ConnPermit,
 ) -> io::Result<()> {
+    let permit = Arc::new(Mutex::new(Some(permit)));
     let tls_stream = match timeout(options.handshake_timeout, tls_acceptor.accept(stream)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
@@ -242,12 +300,25 @@ async fn handle_tls_connection(
         let negotiated_sni = negotiated_sni.clone();
         let allowlist = allowlist.clone();
         let upstream_client = upstream_client.clone();
+        let permit = permit.clone();
+        let options = options.clone();
         move |req: Request<Incoming>| {
             let negotiated_sni = negotiated_sni.clone();
             let allowlist = allowlist.clone();
             let upstream_client = upstream_client.clone();
+            let permit = permit.clone();
+            let options = options.clone();
             async move {
-                handle_http_request(req, peer, &negotiated_sni, &allowlist, &upstream_client).await
+                handle_http_request(
+                    req,
+                    peer,
+                    &negotiated_sni,
+                    &allowlist,
+                    &upstream_client,
+                    permit,
+                    &options,
+                )
+                .await
             }
         }
     });
@@ -288,6 +359,7 @@ async fn handle_tls_connection(
             .with_upgrades()
             .await;
     }
+    let _permit = permit;
     Ok(())
 }
 
@@ -297,6 +369,8 @@ async fn handle_http_request(
     negotiated_sni: &str,
     allowlist: &Allowlist,
     upstream_client: &ClientType<Incoming>,
+    permit: Arc<Mutex<Option<ConnPermit>>>,
+    options: &ProxyOptions,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     if req.method() == hyper::Method::CONNECT {
         debug!(peer = %peer, "rejecting CONNECT method with 405");
@@ -452,13 +526,37 @@ async fn handle_http_request(
     if upstream_res.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(client_fut) = client_upgrade
     {
+        let permit = permit.lock().unwrap().take();
         let upstream_fut = hyper::upgrade::on(&mut upstream_res);
+        let idle_timeout = options.tunnel_idle_timeout;
         tokio::spawn(async move {
+            let _permit = permit;
             match tokio::try_join!(client_fut, upstream_fut) {
                 Ok((client_io, upstream_io)) => {
-                    let mut client_io = TokioIo::new(client_io);
-                    let mut upstream_io = TokioIo::new(upstream_io);
-                    let _ = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await;
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                    let mut client_io = ActivityStream::new(TokioIo::new(client_io), tx.clone());
+                    let mut upstream_io = ActivityStream::new(TokioIo::new(upstream_io), tx);
+                    let mut sleep = Box::pin(tokio::time::sleep(idle_timeout));
+                    let copy_fut = tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io);
+                    tokio::pin!(copy_fut);
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut sleep => {
+                                debug!("tunnel idle timeout reached");
+                                break;
+                            }
+                            Some(()) = rx.recv() => {
+                                sleep.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                            }
+                            res = &mut copy_fut => {
+                                if let Err(e) = res {
+                                    debug!(error = %e, "upgrade streaming error");
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     debug!(error = %e, "upgrade streaming error");
@@ -1961,6 +2059,415 @@ mod tests {
             body.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(body, b"h2 to h1 upstream ok\n");
+
+        gate_task.abort();
+    }
+
+    async fn start_websocket_upstream(
+        server_cert_der: Vec<u8>,
+        server_key_der: Vec<u8>,
+    ) -> SocketAddr {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let mut upstream_server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(server_cert_der)],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key_der.into()),
+            )
+            .unwrap();
+        upstream_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let upstream_acceptor = TlsAcceptor::from(Arc::new(upstream_server_config));
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = upstream_listener.accept().await {
+                let acceptor = upstream_acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = TokioIo::new(tls_stream);
+                    let service =
+                        hyper::service::service_fn(|mut req: Request<Incoming>| async move {
+                            let is_ws = req
+                                .headers()
+                                .get(header::UPGRADE)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|v| v.eq_ignore_ascii_case("websocket"))
+                                .unwrap_or(false);
+                            if is_ws {
+                                let upgrade_fut = hyper::upgrade::on(&mut req);
+                                tokio::spawn(async move {
+                                    if let Ok(upgraded) = upgrade_fut.await {
+                                        let upgraded = TokioIo::new(upgraded);
+                                        let (mut rd, mut wr) = tokio::io::split(upgraded);
+                                        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                                    }
+                                });
+                                let body =
+                                    http_body_util::Empty::new().map_err(|e| match e {}).boxed();
+                                let res = Response::builder()
+                                    .status(StatusCode::SWITCHING_PROTOCOLS)
+                                    .header(header::UPGRADE, "websocket")
+                                    .header(header::CONNECTION, "Upgrade")
+                                    .header(
+                                        header::SEC_WEBSOCKET_ACCEPT,
+                                        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+                                    )
+                                    .body(body)
+                                    .unwrap();
+                                Ok::<_, hyper::Error>(res)
+                            } else {
+                                let body = Full::new(Bytes::from("not websocket\n"))
+                                    .map_err(|e| match e {})
+                                    .boxed();
+                                Ok::<_, hyper::Error>(
+                                    Response::builder().status(200).body(body).unwrap(),
+                                )
+                            }
+                        });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+
+        upstream_addr
+    }
+
+    #[tokio::test]
+    async fn test_websocket_echo() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("allowed.example.com").unwrap(),
+        )];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let upstream_addr =
+            start_websocket_upstream(server_cert.der().to_vec(), server_key.serialize_der()).await;
+
+        let mut cert_store = cert::CertStore::new();
+        cert_store.set_allowlist(HashSet::from(["allowed.example.com".to_string()]));
+        cert_store
+            .add_cert(
+                "default/allowed",
+                server_cert.pem().as_bytes(),
+                server_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        let cert_store = Arc::new(std::sync::RwLock::new(cert_store));
+        let allowlist = make_allowlist(vec!["allowed.example.com"]);
+        let cert_resolver = Arc::new(DynamicCertResolver::new(cert_store, allowlist.clone()));
+
+        let mut client_root_store = rustls::RootCertStore::empty();
+        client_root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+        let upstream_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store.clone())
+                .with_no_client_auth(),
+        );
+
+        let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_addr = gate_listener.local_addr().unwrap();
+        drop(gate_listener);
+
+        let limiter = ConnLimiter::new(10, 10);
+        let gate_task = tokio::spawn(run_tls_proxy_with_config(
+            gate_addr.to_string(),
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            allowlist,
+            cert_resolver,
+            limiter,
+            upstream_tls_config,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let test_client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store)
+                .with_no_client_auth(),
+        );
+        let client_connector = tokio_rustls::TlsConnector::from(test_client_config);
+
+        let tcp = TcpStream::connect(gate_addr).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
+        let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        let req = concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: allowed.example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+
+        let mut res_buf = [0u8; 1024];
+        let mut n = 0;
+        while !res_buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+            let r = tls.read(&mut res_buf[n..]).await.unwrap();
+            assert!(r > 0, "unexpected EOF while reading 101 response");
+            n += r;
+        }
+        let res_header = String::from_utf8_lossy(&res_buf[..n]);
+        assert!(res_header.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        tls.write_all(b"hello websocket\n").await.unwrap();
+        let mut echo_buf = [0u8; 32];
+        let n = tls.read(&mut echo_buf).await.unwrap();
+        assert_eq!(&echo_buf[..n], b"hello websocket\n");
+
+        gate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_websocket_tunnel_holds_permit_until_close() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("allowed.example.com").unwrap(),
+        )];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let upstream_addr =
+            start_websocket_upstream(server_cert.der().to_vec(), server_key.serialize_der()).await;
+
+        let mut cert_store = cert::CertStore::new();
+        cert_store.set_allowlist(HashSet::from(["allowed.example.com".to_string()]));
+        cert_store
+            .add_cert(
+                "default/allowed",
+                server_cert.pem().as_bytes(),
+                server_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        let cert_store = Arc::new(std::sync::RwLock::new(cert_store));
+        let allowlist = make_allowlist(vec!["allowed.example.com"]);
+        let cert_resolver = Arc::new(DynamicCertResolver::new(cert_store, allowlist.clone()));
+
+        let mut client_root_store = rustls::RootCertStore::empty();
+        client_root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+        let upstream_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store.clone())
+                .with_no_client_auth(),
+        );
+
+        let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_addr = gate_listener.local_addr().unwrap();
+        drop(gate_listener);
+
+        let limiter = ConnLimiter::new(10, 10);
+        let gate_task = tokio::spawn(run_tls_proxy_with_config(
+            gate_addr.to_string(),
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            allowlist,
+            cert_resolver,
+            limiter.clone(),
+            upstream_tls_config,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let test_client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store)
+                .with_no_client_auth(),
+        );
+        let client_connector = tokio_rustls::TlsConnector::from(test_client_config);
+
+        let tcp = TcpStream::connect(gate_addr).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
+        let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        let req = concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: allowed.example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+
+        let mut res_buf = [0u8; 1024];
+        let mut n = 0;
+        while !res_buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+            let r = tls.read(&mut res_buf[n..]).await.unwrap();
+            assert!(r > 0, "unexpected EOF while reading 101 response");
+            n += r;
+        }
+        let res_header = String::from_utf8_lossy(&res_buf[..n]);
+        assert!(res_header.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            1,
+            "permit must be kept alive while tunnel is open"
+        );
+
+        drop(tls);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            0,
+            "permit must return to 0 after tunnel is closed"
+        );
+
+        gate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_websocket_tunnel_idle_timeout() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("allowed.example.com").unwrap(),
+        )];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let upstream_addr =
+            start_websocket_upstream(server_cert.der().to_vec(), server_key.serialize_der()).await;
+
+        let mut cert_store = cert::CertStore::new();
+        cert_store.set_allowlist(HashSet::from(["allowed.example.com".to_string()]));
+        cert_store
+            .add_cert(
+                "default/allowed",
+                server_cert.pem().as_bytes(),
+                server_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        let cert_store = Arc::new(std::sync::RwLock::new(cert_store));
+        let allowlist = make_allowlist(vec!["allowed.example.com"]);
+        let cert_resolver = Arc::new(DynamicCertResolver::new(cert_store, allowlist.clone()));
+
+        let mut client_root_store = rustls::RootCertStore::empty();
+        client_root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+        let upstream_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store.clone())
+                .with_no_client_auth(),
+        );
+
+        let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_addr = gate_listener.local_addr().unwrap();
+        drop(gate_listener);
+
+        let limiter = ConnLimiter::new(10, 10);
+        let options = ProxyOptions {
+            upstream_tls_config,
+            tunnel_idle_timeout: Duration::from_millis(100),
+            ..ProxyOptions::default()
+        };
+
+        let gate_task = tokio::spawn(run_tls_proxy_with_options(
+            gate_addr.to_string(),
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            allowlist,
+            cert_resolver,
+            limiter.clone(),
+            options,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let test_client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store)
+                .with_no_client_auth(),
+        );
+        let client_connector = tokio_rustls::TlsConnector::from(test_client_config);
+
+        let tcp = TcpStream::connect(gate_addr).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
+        let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        let req = concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: allowed.example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+
+        let mut res_buf = [0u8; 1024];
+        let mut n = 0;
+        while !res_buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+            let r = tls.read(&mut res_buf[n..]).await.unwrap();
+            assert!(r > 0, "unexpected EOF while reading 101 response");
+            n += r;
+        }
+        let res_header = String::from_utf8_lossy(&res_buf[..n]);
+        assert!(res_header.starts_with("HTTP/1.1 101 Switching Protocols"));
+
+        let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            1
+        );
+
+        // Sit idle without sending any data. Read from connection expecting EOF on timeout.
+        let mut buf = [0u8; 128];
+        let n = tls.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "expected EOF when idle tunnel closes");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            0,
+            "permit must be released after idle tunnel closes"
+        );
 
         gate_task.abort();
     }
