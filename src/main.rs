@@ -36,7 +36,7 @@ async fn main() {
     );
 
     let limiter = proxy::ConnLimiter::new(
-        env_usize("MAX_CONN", 1024).clamp(1, 65_536),
+        env_usize("MAX_CONN", 256).clamp(1, 65_536),
         env_usize("MAX_CONN_PER_IP", 50).max(1),
     );
 

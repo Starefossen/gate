@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::{WatchStreamExt, watcher};
 use tracing::{info, warn};
@@ -165,19 +165,31 @@ async fn update_allowlist(
         }
     }
     if let Ok(mut store) = cert_store.write() {
-        store.set_allowlist(hosts);
+        store.set_allowlist(hosts.clone());
+        for host in &hosts {
+            if store.resolve(host).is_none() {
+                warn!(
+                    host = %host,
+                    "allowlisted host has no matching TLS certificate in gate namespace"
+                );
+            }
+        }
     }
 }
 
-/// Watches Knative Services, DomainMappings, and TLS Secrets.
+/// Watches Knative Services, DomainMappings, and namespaced TLS Secrets in gate namespace.
 /// Updates allowlist on exposed route changes and loads/reloads certificates.
 pub async fn run(
     allowlist: Allowlist,
     cert_store: Arc<std::sync::RwLock<CertStore>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
+    let gate_ns = std::env::var("GATE_NAMESPACE").unwrap_or_else(|_| "gate".to_string());
 
-    info!("watching Knative Services, DomainMappings, and Secrets for TLS termination");
+    info!(
+        gate_namespace = %gate_ns,
+        "watching Knative Services, DomainMappings, and namespaced TLS Secrets"
+    );
 
     let services = watch_custom(client.clone(), "serving.knative.dev", "v1", "Service")
         .map_ok(ControllerEvent::Service);
@@ -189,8 +201,10 @@ pub async fn run(
     )
     .map_ok(ControllerEvent::DomainMapping);
 
-    let secrets_api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(client);
-    let secrets = watcher(secrets_api, watcher::Config::default())
+    let secrets_api: Api<k8s_openapi::api::core::v1::Secret> =
+        Api::namespaced(client.clone(), &gate_ns);
+    let secrets_config = watcher::Config::default().fields("type=kubernetes.io/tls");
+    let secrets = watcher(secrets_api, secrets_config)
         .default_backoff()
         .map_ok(ControllerEvent::Secret);
 
@@ -199,7 +213,15 @@ pub async fn run(
 
     let mut states = [State::default(), State::default()];
 
-    while let Some(event) = stream.try_next().await? {
+    while let Some(item) = stream.next().await {
+        let event = match item {
+            Ok(e) => e,
+            Err(err) => {
+                warn!(error = %err, "watcher error, continuing with backoff");
+                continue;
+            }
+        };
+
         match event {
             ControllerEvent::Service(e) => {
                 if states[0].apply(e) {
@@ -232,6 +254,7 @@ pub async fn run(
         }
     }
 
+    warn!("watcher stream ended unexpectedly");
     Ok(())
 }
 

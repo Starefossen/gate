@@ -7,15 +7,23 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tracing::{debug, info, warn};
+use x509_parser::prelude::*;
 
 use crate::Allowlist;
+
+#[derive(Clone)]
+struct StoredCert {
+    certified_key: Arc<CertifiedKey>,
+    not_before: i64,
+    secret_key: String,
+}
 
 /// Stores parsed TLS certificates indexed by exact hostname and wildcard suffix.
 #[derive(Default)]
 pub struct CertStore {
     allowlist: HashSet<String>,
-    exact: HashMap<String, Arc<CertifiedKey>>,
-    wildcards: HashMap<String, Arc<CertifiedKey>>,
+    exact: HashMap<String, StoredCert>,
+    wildcards: HashMap<String, StoredCert>,
     secrets: HashMap<String, Vec<String>>,
 }
 
@@ -42,7 +50,7 @@ impl CertStore {
             return Err("empty certificate chain".into());
         }
 
-        let dns_names = extract_dns_names(cert_chain[0].as_ref());
+        let (dns_names, not_before) = parse_cert_metadata(cert_chain[0].as_ref())?;
         if dns_names.is_empty() {
             warn!(
                 secret = secret_key,
@@ -64,13 +72,65 @@ impl CertStore {
         let mut registered = Vec::new();
         for name in &dns_names {
             let normalized = normalize_name(name);
-            if let Some(suffix) = normalized.strip_prefix("*.") {
-                self.wildcards
-                    .insert(suffix.to_string(), certified_key.clone());
+            let is_wildcard = normalized.starts_with("*.");
+            let lookup_key = if is_wildcard {
+                normalized.strip_prefix("*.").unwrap().to_string()
             } else {
-                self.exact.insert(normalized.clone(), certified_key.clone());
+                normalized.clone()
+            };
+
+            let map = if is_wildcard {
+                &mut self.wildcards
+            } else {
+                &mut self.exact
+            };
+
+            let should_insert = match map.get(&lookup_key) {
+                Some(existing) => {
+                    if not_before > existing.not_before {
+                        warn!(
+                            domain = %normalized,
+                            secret = %secret_key,
+                            existing_secret = %existing.secret_key,
+                            "duplicate SAN: replacing older certificate (notBefore: {}) with newer (notBefore: {})",
+                            existing.not_before, not_before
+                        );
+                        true
+                    } else if not_before < existing.not_before {
+                        warn!(
+                            domain = %normalized,
+                            secret = %secret_key,
+                            existing_secret = %existing.secret_key,
+                            "duplicate SAN: rejecting certificate with older notBefore ({} < {})",
+                            not_before, existing.not_before
+                        );
+                        false
+                    } else if existing.secret_key == secret_key {
+                        true
+                    } else {
+                        warn!(
+                            domain = %normalized,
+                            secret = %secret_key,
+                            existing_secret = %existing.secret_key,
+                            "duplicate SAN with identical notBefore; rejecting ambiguity"
+                        );
+                        false
+                    }
+                }
+                None => true,
+            };
+
+            if should_insert {
+                map.insert(
+                    lookup_key,
+                    StoredCert {
+                        certified_key: certified_key.clone(),
+                        not_before,
+                        secret_key: secret_key.to_string(),
+                    },
+                );
+                registered.push(normalized);
             }
-            registered.push(normalized);
         }
 
         self.secrets
@@ -78,6 +138,7 @@ impl CertStore {
         info!(
             secret = secret_key,
             domains = ?registered,
+            not_before,
             "loaded TLS certificate"
         );
 
@@ -88,8 +149,14 @@ impl CertStore {
         if let Some(names) = self.secrets.remove(secret_key) {
             for name in names {
                 if let Some(suffix) = name.strip_prefix("*.") {
-                    self.wildcards.remove(suffix);
-                } else {
+                    if let Some(entry) = self.wildcards.get(suffix)
+                        && entry.secret_key == secret_key
+                    {
+                        self.wildcards.remove(suffix);
+                    }
+                } else if let Some(entry) = self.exact.get(&name)
+                    && entry.secret_key == secret_key
+                {
                     self.exact.remove(&name);
                 }
             }
@@ -101,15 +168,15 @@ impl CertStore {
         let normalized = normalize_name(host);
 
         // 1. Check exact match
-        if let Some(key) = self.exact.get(&normalized) {
-            return Some(key.clone());
+        if let Some(entry) = self.exact.get(&normalized) {
+            return Some(entry.certified_key.clone());
         }
 
         // 2. Check single-level wildcard match
         if let Some((_prefix, suffix)) = normalized.split_once('.')
-            && let Some(key) = self.wildcards.get(suffix)
+            && let Some(entry) = self.wildcards.get(suffix)
         {
-            return Some(key.clone());
+            return Some(entry.certified_key.clone());
         }
 
         None
@@ -167,90 +234,40 @@ pub fn normalize_name(name: &str) -> String {
     name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Extract all DNS names (SANs and subject CN) from a DER-encoded X.509 certificate.
-pub fn extract_dns_names(der: &[u8]) -> HashSet<String> {
-    let mut names = HashSet::new();
+/// Extract all DNS names (SANs and subject CN as fallback) along with notBefore from a DER-encoded X.509 certificate.
+pub fn parse_cert_metadata(
+    der: &[u8],
+) -> Result<(HashSet<String>, i64), Box<dyn Error + Send + Sync>> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der)
+        .map_err(|e| format!("failed to parse X.509 certificate: {e}"))?;
+    let not_before = cert.validity().not_before.timestamp();
 
-    // 1. Extract SANs (Subject Alternative Names) - OID 2.5.29.17: 55 1d 11
-    let san_oid = [0x55, 0x1d, 0x11];
-    if let Some(pos) = find_subsequence(der, &san_oid) {
-        let mut idx = pos + san_oid.len();
-        // Skip optional boolean critical (01 01 xx)
-        if idx + 3 <= der.len() && der[idx] == 0x01 && der[idx + 1] == 0x01 {
-            idx += 3;
-        }
-        // Next should be OCTET STRING (0x04)
-        if idx < der.len()
-            && der[idx] == 0x04
-            && let Some((octet_data, _)) = read_tlv_value(&der[idx..])
-            && !octet_data.is_empty()
-            && octet_data[0] == 0x30
-            && let Some((seq_data, _)) = read_tlv_value(octet_data)
-        {
-            let mut p = 0;
-            while p < seq_data.len() {
-                let tag = seq_data[p];
-                if let Some((val, total_len)) = read_tlv_value(&seq_data[p..]) {
-                    // Tag [2] context-specific primitive is dNSName
-                    if tag == 0x82
-                        && let Ok(s) = std::str::from_utf8(val)
-                    {
-                        names.insert(normalize_name(s));
-                    }
-                    p += total_len;
-                } else {
-                    break;
-                }
+    let mut names = HashSet::new();
+    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
+        for name in &san_ext.value.general_names {
+            if let GeneralName::DNSName(dns) = name {
+                names.insert(normalize_name(dns));
             }
         }
     }
 
-    // 2. Extract Common Name (CN) - OID 2.5.4.3: 55 04 03
-    let cn_oid = [0x55, 0x04, 0x03];
-    if let Some(pos) = find_subsequence(der, &cn_oid) {
-        let idx = pos + cn_oid.len();
-        if idx < der.len()
-            && let Some((val, _)) = read_tlv_value(&der[idx..])
-            && let Ok(s) = std::str::from_utf8(val)
-        {
-            names.insert(normalize_name(s));
+    // Ignore CN when SANs are present; use subject CN only as fallback if no SANs exist
+    if names.is_empty() {
+        for cn in cert.subject().iter_common_name() {
+            if let Ok(s) = cn.as_str() {
+                names.insert(normalize_name(s));
+            }
         }
     }
 
-    names
+    Ok((names, not_before))
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Reads the value of a TLV element and returns (value_bytes, total_tlv_len)
-fn read_tlv_value(data: &[u8]) -> Option<(&[u8], usize)> {
-    if data.len() < 2 {
-        return None;
-    }
-    let len_byte = data[1];
-    let (val_len, header_len) = if len_byte < 0x80 {
-        (len_byte as usize, 2)
-    } else {
-        let num_len_bytes = (len_byte & 0x7f) as usize;
-        if num_len_bytes == 0 || num_len_bytes > 4 || 2 + num_len_bytes > data.len() {
-            return None;
-        }
-        let mut len = 0usize;
-        for i in 0..num_len_bytes {
-            len = (len << 8) | (data[2 + i] as usize);
-        }
-        (len, 2 + num_len_bytes)
-    };
-
-    if header_len + val_len > data.len() {
-        return None;
-    }
-    Some((
-        &data[header_len..header_len + val_len],
-        header_len + val_len,
-    ))
+/// Convenience function extracting only DNS names.
+pub fn extract_dns_names(der: &[u8]) -> HashSet<String> {
+    parse_cert_metadata(der)
+        .map(|(names, _)| names)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -264,13 +281,100 @@ mod tests {
             rcgen::SanType::DnsName(rcgen::Ia5String::try_from("hello.example.com").unwrap()),
             rcgen::SanType::DnsName(rcgen::Ia5String::try_from("*.wildcard.example.com").unwrap()),
         ];
+        // Set a CN to verify it is ignored when SANs are present
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("ignored-cn.example.com".to_string()),
+        );
+
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let cert = params.self_signed(&key).unwrap();
         let der = cert.der();
 
-        let names = extract_dns_names(der);
+        let (names, _not_before) = parse_cert_metadata(der).unwrap();
         assert!(names.contains("hello.example.com"));
         assert!(names.contains("*.wildcard.example.com"));
+        assert!(
+            !names.contains("ignored-cn.example.com"),
+            "CN must be ignored when SANs are present"
+        );
+    }
+
+    #[test]
+    fn test_cn_fallback_when_no_san() {
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("fallback-cn.example.com".to_string()),
+        );
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der();
+
+        let (names, _) = parse_cert_metadata(der).unwrap();
+        assert!(names.contains("fallback-cn.example.com"));
+    }
+
+    #[test]
+    fn test_duplicate_san_prefers_newest_not_before() {
+        let mut store = CertStore::new();
+
+        // Older cert: 2024-01-01
+        let mut p1 = rcgen::CertificateParams::default();
+        p1.not_before = rcgen::date_time_ymd(2024, 1, 1);
+        p1.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("shared.example.com").unwrap(),
+        )];
+        let k1 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let c1 = p1.self_signed(&k1).unwrap();
+
+        // Newer cert: 2025-01-01
+        let mut p2 = rcgen::CertificateParams::default();
+        p2.not_before = rcgen::date_time_ymd(2025, 1, 1);
+        p2.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("shared.example.com").unwrap(),
+        )];
+        let k2 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let c2 = p2.self_signed(&k2).unwrap();
+
+        // Add older cert first
+        store
+            .add_cert(
+                "gate/cert-old",
+                c1.pem().as_bytes(),
+                k1.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.exact.get("shared.example.com").unwrap().secret_key,
+            "gate/cert-old"
+        );
+
+        // Add newer cert -> replaces older cert
+        store
+            .add_cert(
+                "gate/cert-new",
+                c2.pem().as_bytes(),
+                k2.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.exact.get("shared.example.com").unwrap().secret_key,
+            "gate/cert-new"
+        );
+
+        // Re-adding older cert -> rejected, newer cert remains!
+        store
+            .add_cert(
+                "gate/cert-old",
+                c1.pem().as_bytes(),
+                k1.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.exact.get("shared.example.com").unwrap().secret_key,
+            "gate/cert-new"
+        );
     }
 
     #[test]

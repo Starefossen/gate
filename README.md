@@ -22,8 +22,9 @@ Internet → [Gate :443] ──── TLS termination ────→ [Kourier/E
 1. Gate watches all Knative Services and DomainMappings for the
    `gate.flaatten.org/expose: "true"` annotation. A DomainMapping needs its own
    annotation; exposing the target Service does not expose its custom domains
-2. Gate watches Kubernetes TLS secrets (`kubernetes.io/tls`) and dynamically
-   loads and hot-reloads TLS certificates provisioned by Knative/cert-manager
+2. Gate watches Kubernetes TLS secrets (`type=kubernetes.io/tls`) strictly within
+   its own `gate` namespace via a namespaced Role, dynamically loading and
+   hot-reloading TLS certificates provisioned by cert-manager
 3. Incoming TLS connections: SNI is checked against the allowlist. Unknown or
    unauthorized SNIs are rejected during the TLS handshake
 4. For each HTTP request (HTTP/1.1 and HTTP/2 via ALPN), Gate verifies that
@@ -44,26 +45,52 @@ Internet → [Gate :443] ──── TLS termination ────→ [Kourier/E
 | `UPSTREAM_PORT` | `443`                        | Backend TLS port              |
 | `TLS_LISTEN`    | `0.0.0.0:8443`               | TLS proxy listen address      |
 | `HTTP_LISTEN`   | `0.0.0.0:8080`               | HTTP redirect listen address  |
-| `MAX_CONN`      | `1024`                       | Global concurrent connection cap |
+| `MAX_CONN`      | `256`                        | Global concurrent connection cap (sized for 128Mi memory limit) |
 | `MAX_CONN_PER_IP` | `50`                       | Per-client-IP concurrent connection cap |
 | `HEALTH_LISTEN` | `0.0.0.0:9090`               | Health check endpoint         |
 | `RUST_LOG`      | `gate=info`                  | Log level filter              |
 
 ## Exposing a Service
 
-Annotate any Knative Service to make it reachable through gate:
+Exposing a service requires two steps:
+
+### 1. Annotate Service or DomainMapping
+
+Annotate the Knative Service or DomainMapping to add it to Gate's allowlist:
 
 ```bash
 kubectl annotate ksvc my-service gate.flaatten.org/expose=true
 ```
 
-Remove the annotation to revoke access:
+To remove access:
 
 ```bash
 kubectl annotate ksvc my-service gate.flaatten.org/expose-
 ```
 
-Changes take effect immediately — gate watches the Kubernetes API in real time.
+### 2. Add Certificate Manifest in `gate` Namespace
+
+Gate only reads TLS secrets in its own `gate` namespace. Add a cert-manager `Certificate` in `apps/gate/config/certificates.yaml`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-service.fn.flaatten.org
+  namespace: gate
+spec:
+  secretName: my-service.fn.flaatten.org-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - my-service.fn.flaatten.org
+```
+
+> [!NOTE]
+> If an allowlisted host does not yet have a matching certificate in the `gate` namespace, Gate logs a clear warning:
+> `allowlisted host has no matching TLS certificate in gate namespace`
+> Client TLS handshakes for that host will fail until the secret is populated.
 
 ## Deploy
 
@@ -83,29 +110,20 @@ mise run delete       # Remove all resources
 The deployment creates:
 
 - **Namespace** `gate`
-- **ServiceAccount** with ClusterRole to watch Knative Services, DomainMappings,
-  and Secrets
-- **Deployment** (distroless container, 16-64Mi memory)
-- **LoadBalancer Service** on the external MetalLB pool (ports 80, 443)
+- **ServiceAccount** `gate` with:
+  - `ClusterRole`: `services` and `domainmappings` in `serving.knative.dev` (`get`, `list`, `watch`)
+  - Namespaced `Role` in namespace `gate`: `secrets` (`get`, `list`, `watch`)
+- **Deployment** (distroless container, 16Mi request / 128Mi memory limit)
+  - Memory limit is set to 128Mi: at `MAX_CONN=256`, each active TLS + HTTP/2 connection consumes ~200-400 KiB (buffers, rustls sessions, and task state), requiring ~64-100 MiB under peak concurrent load, leaving sufficient headroom for dynamic cert loading and streaming without OOM-killer pressure.
+- **LoadBalancer Service** on the external IP pool (ports 80, 443)
 - **CiliumNetworkPolicy** allowing internet ingress and egress to Kourier, K8s
   API, and DNS
 
-#### RBAC Trade-off on Secrets
+#### Secret Isolation & Least Privilege
 
-Gate requires a `ClusterRole` granting `get`, `list`, and `watch` permissions
-on `secrets`:
-
-- **Why not namespaced `Role`?** Knative auto-tls provisions TLS secrets in the
-  application namespace where each service resides (`hello`, `varden-blog`,
-  etc.). Because services in arbitrary namespaces can be exposed dynamically at
-  runtime by adding annotations, static namespaced Roles cannot adapt dynamically
-  without additional complex operators.
-- **Why not `resourceNames`?** Kubernetes RBAC does not permit `resourceNames`
-  restrictions with collection-level `list` or `watch` verbs.
-- **In-memory mitigation:** Gate operates strictly read-only, filters in memory
-  exclusively for `type: kubernetes.io/tls` (or secrets containing `tls.crt` /
-  `tls.key`), and only stores certificates matching allowlisted/exposed
-  hostnames.
+Gate avoids cluster-wide secrets access:
+- **Namespaced Role:** Gate reads TLS secrets only within its own `gate` namespace via a namespaced Role and field selector `type=kubernetes.io/tls`.
+- **Cert-Manager Provisioning:** Services exposed through Gate have their public certificates explicitly provisioned in `gate` namespace, preventing Gate from accessing application secrets, tokens, or private data in workload namespaces.
 
 ## Development
 

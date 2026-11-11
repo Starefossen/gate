@@ -17,9 +17,6 @@ rules:
   - apiGroups: ["serving.knative.dev"]
     resources: ["services", "domainmappings"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -29,6 +26,30 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: gate
+subjects:
+  - kind: ServiceAccount
+    name: gate
+    namespace: gate
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gate-secrets
+  namespace: gate
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gate-secrets
+  namespace: gate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gate-secrets
 subjects:
   - kind: ServiceAccount
     name: gate
@@ -65,6 +86,8 @@ spec:
           env:
             - name: UPSTREAM_HOST
               value: "kourier.kourier-system.svc"
+            - name: MAX_CONN
+              value: "256"
             - name: RUST_LOG
               value: "gate=info"
           securityContext:
@@ -91,7 +114,7 @@ spec:
               memory: "16Mi"
               cpu: "10m"
             limits:
-              memory: "64Mi"
+              memory: "128Mi"
 ---
 apiVersion: v1
 kind: Service

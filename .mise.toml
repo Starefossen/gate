@@ -36,6 +36,7 @@ run = """
   echo "Deploying ${APP_NAME} with image ${IMAGE}..."
   sed "s|image:.*gate.*|image: ${IMAGE}|g" config/deployment.yaml | kubectl apply -f -
   kubectl apply -f config/networkpolicy.yaml
+  kubectl apply -f config/certificates.yaml
   kubectl rollout status deployment/gate -n gate --timeout=120s
   echo "Deployed successfully"
 """
@@ -77,6 +78,7 @@ description = "Delete all gate resources"
 run = """
   kubectl delete -f config/deployment.yaml --ignore-not-found
   kubectl delete -f config/networkpolicy.yaml --ignore-not-found
+  kubectl delete -f config/certificates.yaml --ignore-not-found
 """
 
 [tasks.test]
