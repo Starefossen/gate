@@ -1,6 +1,8 @@
+pub mod cert;
 pub mod controller;
 pub mod proxy;
 pub mod sni;
+pub mod upstream;
 
 use std::collections::HashSet;
 use std::sync::Arc;

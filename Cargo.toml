@@ -10,6 +10,16 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures = "0.3"
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+tower-service = "0.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
 
 [profile.release]
 opt-level = "z"
@@ -19,3 +29,4 @@ strip = true
 
 [dev-dependencies]
 serde_json = "1.0.149"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }

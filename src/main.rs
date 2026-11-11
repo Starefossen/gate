@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use gate::cert::{CertStore, DynamicCertResolver};
 use gate::{Allowlist, controller, proxy};
 
 #[tokio::main]
@@ -16,16 +17,22 @@ async fn main() {
         .init();
 
     let allowlist: Allowlist = Arc::new(RwLock::new(HashSet::new()));
+    let cert_store = Arc::new(std::sync::RwLock::new(CertStore::new()));
+    let cert_resolver = Arc::new(DynamicCertResolver::new(
+        cert_store.clone(),
+        allowlist.clone(),
+    ));
 
     let upstream_host =
         std::env::var("UPSTREAM_HOST").unwrap_or_else(|_| "kourier.kourier-system.svc".into());
+    let upstream_port = env_u16("UPSTREAM_PORT", 443);
     let tls_listen = std::env::var("TLS_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".into());
     let http_listen = std::env::var("HTTP_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let health_listen = std::env::var("HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:9090".into());
 
     info!(
         upstream = upstream_host,
-        tls_listen, http_listen, health_listen, "starting gate"
+        upstream_port, tls_listen, http_listen, health_listen, "starting gate"
     );
 
     let limiter = proxy::ConnLimiter::new(
@@ -36,8 +43,9 @@ async fn main() {
     let tls_proxy = proxy::run_tls_proxy(
         tls_listen,
         upstream_host.clone(),
-        443,
+        upstream_port,
         allowlist.clone(),
+        cert_resolver,
         limiter.clone(),
     );
 
@@ -45,7 +53,7 @@ async fn main() {
 
     let health = proxy::run_health_server(health_listen);
 
-    let controller = controller::run(allowlist.clone());
+    let controller = controller::run(allowlist.clone(), cert_store.clone());
 
     tokio::select! {
         r = tls_proxy => { if let Err(e) = r { tracing::error!(error = %e, "tls proxy exited"); } }
@@ -56,6 +64,13 @@ async fn main() {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u16(key: &str, default: u16) -> u16 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())

@@ -28,6 +28,8 @@ spec:
             app: 3scale-kourier-gateway
       toPorts:
         - ports:
+            - port: "443"
+              protocol: TCP
             - port: "8080"
               protocol: TCP
             - port: "8443"

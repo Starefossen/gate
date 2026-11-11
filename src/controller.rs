@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use futures::TryStreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::{WatchStreamExt, watcher};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::Allowlist;
+use crate::cert::CertStore;
 
 const ANNOTATION_KEY: &str = "gate.flaatten.org/expose";
 
@@ -100,41 +102,133 @@ impl State {
     }
 }
 
-fn watch(
+enum ControllerEvent {
+    Service(watcher::Event<DynamicObject>),
+    DomainMapping(watcher::Event<DynamicObject>),
+    Secret(watcher::Event<k8s_openapi::api::core::v1::Secret>),
+}
+
+fn watch_custom(
     client: kube::Client,
-    kind: &str,
+    group: &str,
     version: &str,
+    kind: &str,
 ) -> impl futures::Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>> {
-    let gvk = GroupVersionKind::gvk("serving.knative.dev", version, kind);
+    let gvk = GroupVersionKind::gvk(group, version, kind);
     let api: Api<DynamicObject> = Api::all_with(client, &ApiResource::from_gvk(&gvk));
     watcher(api, watcher::Config::default()).default_backoff()
 }
 
-/// Watches Knative Services and DomainMappings. A DomainMapping must carry
-/// the expose annotation itself: exposing a Service does not expose the
-/// custom domains that point at it.
-pub async fn run(allowlist: Allowlist) -> Result<(), Box<dyn std::error::Error>> {
+pub fn apply_secret(store: &mut CertStore, secret: &k8s_openapi::api::core::v1::Secret) {
+    let is_tls = secret.type_.as_deref() == Some("kubernetes.io/tls")
+        || secret
+            .data
+            .as_ref()
+            .map(|d| d.contains_key("tls.crt") && d.contains_key("tls.key"))
+            .unwrap_or(false);
+    if !is_tls {
+        return;
+    }
+
+    let Some(data) = secret.data.as_ref() else {
+        return;
+    };
+    let Some(cert_bytes) = data.get("tls.crt").map(|bs| &bs.0) else {
+        return;
+    };
+    let Some(key_bytes) = data.get("tls.key").map(|bs| &bs.0) else {
+        return;
+    };
+
+    let key = format!(
+        "{}/{}",
+        secret.metadata.namespace.as_deref().unwrap_or(""),
+        secret.metadata.name.as_deref().unwrap_or("")
+    );
+
+    if let Err(e) = store.add_cert(&key, cert_bytes, key_bytes) {
+        warn!(secret = %key, error = %e, "failed to load TLS certificate from secret");
+    }
+}
+
+async fn update_allowlist(
+    states: &[State; 2],
+    allowlist: &Allowlist,
+    cert_store: &Arc<std::sync::RwLock<CertStore>>,
+) {
+    let hosts: HashSet<String> = states.iter().flat_map(State::host_set).collect();
+    {
+        let mut guard = allowlist.write().await;
+        if *guard != hosts {
+            *guard = hosts.clone();
+            info!(count = guard.len(), hosts = ?*guard, "allowlist updated");
+        }
+    }
+    if let Ok(mut store) = cert_store.write() {
+        store.set_allowlist(hosts);
+    }
+}
+
+/// Watches Knative Services, DomainMappings, and TLS Secrets.
+/// Updates allowlist on exposed route changes and loads/reloads certificates.
+pub async fn run(
+    allowlist: Allowlist,
+    cert_store: Arc<std::sync::RwLock<CertStore>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
 
-    info!("watching Knative Services and DomainMappings for gate.flaatten.org/expose annotation");
+    info!("watching Knative Services, DomainMappings, and Secrets for TLS termination");
 
-    let services = watch(client.clone(), "Service", "v1").map_ok(|e| (0, e));
-    let mappings = watch(client, "DomainMapping", "v1beta1").map_ok(|e| (1, e));
-    let stream = futures::stream::select(services, mappings);
+    let services = watch_custom(client.clone(), "serving.knative.dev", "v1", "Service")
+        .map_ok(ControllerEvent::Service);
+    let mappings = watch_custom(
+        client.clone(),
+        "serving.knative.dev",
+        "v1beta1",
+        "DomainMapping",
+    )
+    .map_ok(ControllerEvent::DomainMapping);
+
+    let secrets_api: Api<k8s_openapi::api::core::v1::Secret> = Api::all(client);
+    let secrets = watcher(secrets_api, watcher::Config::default())
+        .default_backoff()
+        .map_ok(ControllerEvent::Secret);
+
+    let stream = futures::stream::select(futures::stream::select(services, mappings), secrets);
     tokio::pin!(stream);
 
     let mut states = [State::default(), State::default()];
 
-    while let Some((i, event)) = stream.try_next().await? {
-        if states[i].apply(event) {
-            let hosts: HashSet<String> = states.iter().flat_map(State::host_set).collect();
-            let mut guard = allowlist.write().await;
-            if *guard != hosts {
-                *guard = hosts;
-                info!(count = guard.len(), hosts = ?*guard, "allowlist updated");
+    while let Some(event) = stream.try_next().await? {
+        match event {
+            ControllerEvent::Service(e) => {
+                if states[0].apply(e) {
+                    update_allowlist(&states, &allowlist, &cert_store).await;
+                }
             }
-        } else {
-            debug!("watch event, allowlist unchanged");
+            ControllerEvent::DomainMapping(e) => {
+                if states[1].apply(e) {
+                    update_allowlist(&states, &allowlist, &cert_store).await;
+                }
+            }
+            ControllerEvent::Secret(e) => match e {
+                watcher::Event::Apply(secret) | watcher::Event::InitApply(secret) => {
+                    if let Ok(mut store) = cert_store.write() {
+                        apply_secret(&mut store, &secret);
+                    }
+                }
+                watcher::Event::Delete(secret) => {
+                    let key = format!(
+                        "{}/{}",
+                        secret.metadata.namespace.as_deref().unwrap_or(""),
+                        secret.metadata.name.as_deref().unwrap_or("")
+                    );
+                    if let Ok(mut store) = cert_store.write() {
+                        store.remove_cert(&key);
+                    }
+                }
+                _ => {}
+            },
         }
     }
 
@@ -351,5 +445,67 @@ mod tests {
             union(&services, &mappings),
             HashSet::from([HOST.to_string()])
         );
+    }
+
+    #[test]
+    fn test_apply_and_remove_secret() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("hello.fn.flaatten.org").unwrap(),
+        )];
+        let cert = params.self_signed(&key).unwrap();
+
+        let mut data = BTreeMap::new();
+        data.insert(
+            "tls.crt".into(),
+            k8s_openapi::ByteString(cert.pem().into_bytes()),
+        );
+        data.insert(
+            "tls.key".into(),
+            k8s_openapi::ByteString(key.serialize_pem().into_bytes()),
+        );
+
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some("hello.fn.flaatten.org".into()),
+                namespace: Some("hello".into()),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/tls".into()),
+            data: Some(data),
+            ..Default::default()
+        };
+
+        let mut store = CertStore::new();
+        apply_secret(&mut store, &secret);
+        assert!(store.resolve("hello.fn.flaatten.org").is_some());
+
+        store.remove_cert("hello/hello.fn.flaatten.org");
+        assert!(store.resolve("hello.fn.flaatten.org").is_none());
+    }
+
+    #[test]
+    fn test_apply_secret_ignores_non_tls() {
+        let mut data = BTreeMap::new();
+        data.insert(
+            "password".into(),
+            k8s_openapi::ByteString(b"secret".to_vec()),
+        );
+
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some("db-creds".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            type_: Some("Opaque".into()),
+            data: Some(data),
+            ..Default::default()
+        };
+
+        let mut store = CertStore::new();
+        apply_secret(&mut store, &secret);
+        assert!(store.resolve("hello.fn.flaatten.org").is_none());
     }
 }
