@@ -1,19 +1,6 @@
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: hello.hello.fn.flaatten.org
-  namespace: gate
-spec:
-  secretName: hello.hello.fn.flaatten.org-tls
-  issuerRef:
-    name: letsencrypt-prod
-    kind: ClusterIssuer
-  dnsNames:
-    - hello.hello.fn.flaatten.org
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
   name: varden.flaatten.org
   namespace: gate
 spec:
