@@ -84,13 +84,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityStream<T> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &res
-            && *n > 0
-        {
-            let _ = self.tx.try_send(());
-        }
-        res
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -273,7 +267,7 @@ async fn handle_tls_connection(
     options: ProxyOptions,
     permit: ConnPermit,
 ) -> io::Result<()> {
-    let permit = Arc::new(Mutex::new(Some(permit)));
+    let permit = Arc::new(permit);
     let tls_stream = match timeout(options.handshake_timeout, tls_acceptor.accept(stream)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
@@ -369,7 +363,7 @@ async fn handle_http_request(
     negotiated_sni: &str,
     allowlist: &Allowlist,
     upstream_client: &ClientType<Incoming>,
-    permit: Arc<Mutex<Option<ConnPermit>>>,
+    permit: Arc<ConnPermit>,
     options: &ProxyOptions,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     if req.method() == hyper::Method::CONNECT {
@@ -419,7 +413,7 @@ async fn handle_http_request(
             Err(_) => return Ok(bad_request_response()),
         };
 
-    let is_websocket_upgrade = {
+    let is_websocket_upgrade = req.version() == hyper::Version::HTTP_11 && {
         let has_upgrade_ws = req
             .headers()
             .get(header::UPGRADE)
@@ -526,11 +520,11 @@ async fn handle_http_request(
     if upstream_res.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(client_fut) = client_upgrade
     {
-        let permit = permit.lock().unwrap().take();
+        let tunnel_permit = permit.clone();
         let upstream_fut = hyper::upgrade::on(&mut upstream_res);
         let idle_timeout = options.tunnel_idle_timeout;
         tokio::spawn(async move {
-            let _permit = permit;
+            let _permit = tunnel_permit;
             match tokio::try_join!(client_fut, upstream_fut) {
                 Ok((client_io, upstream_io)) => {
                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -2347,6 +2341,157 @@ mod tests {
             *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
             0,
             "permit must return to 0 after tunnel is closed"
+        );
+
+        gate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_h2_request_with_upgrade_headers_holds_permit_while_open() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("allowed.example.com").unwrap(),
+        )];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let upstream_addr =
+            start_websocket_upstream(server_cert.der().to_vec(), server_key.serialize_der()).await;
+
+        let mut cert_store = cert::CertStore::new();
+        cert_store.set_allowlist(HashSet::from(["allowed.example.com".to_string()]));
+        cert_store
+            .add_cert(
+                "default/allowed",
+                server_cert.pem().as_bytes(),
+                server_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        let cert_store = Arc::new(std::sync::RwLock::new(cert_store));
+        let allowlist = make_allowlist(vec!["allowed.example.com"]);
+        let cert_resolver = Arc::new(DynamicCertResolver::new(cert_store, allowlist.clone()));
+
+        let mut client_root_store = rustls::RootCertStore::empty();
+        client_root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+        let upstream_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store.clone())
+                .with_no_client_auth(),
+        );
+
+        let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_addr = gate_listener.local_addr().unwrap();
+        drop(gate_listener);
+
+        let limiter = ConnLimiter::new(10, 10);
+        let gate_task = tokio::spawn(run_tls_proxy_with_config(
+            gate_addr.to_string(),
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            allowlist,
+            cert_resolver,
+            limiter.clone(),
+            upstream_tls_config,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut test_client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(client_root_store)
+            .with_no_client_auth();
+        test_client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let client_connector = tokio_rustls::TlsConnector::from(Arc::new(test_client_config));
+
+        let tcp = TcpStream::connect(gate_addr).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
+        let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+
+        let peer_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            1,
+            "permit must be acquired on connection accept"
+        );
+
+        // Send HTTP/2 connection preface
+        tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        // Send client empty SETTINGS frame
+        tls.write_all(&[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+
+        // Construct HEADERS frame on stream 1 carrying Upgrade and Connection headers
+        let mut hpack = vec![
+            0x82, // :method: GET
+            0x84, // :path: /
+            0x87, // :scheme: https
+            0x00, 10, // :authority (literal without indexing, new name)
+        ];
+        hpack.extend_from_slice(b":authority");
+        hpack.push(19);
+        hpack.extend_from_slice(b"allowed.example.com");
+
+        hpack.extend_from_slice(&[0x00, 7]);
+        hpack.extend_from_slice(b"upgrade");
+        hpack.push(9);
+        hpack.extend_from_slice(b"websocket");
+
+        hpack.extend_from_slice(&[0x00, 10]);
+        hpack.extend_from_slice(b"connection");
+        hpack.push(7);
+        hpack.extend_from_slice(b"upgrade");
+
+        let frame_len = hpack.len() as u32;
+        let mut frame = vec![
+            ((frame_len >> 16) & 0xFF) as u8,
+            ((frame_len >> 8) & 0xFF) as u8,
+            (frame_len & 0xFF) as u8,
+            0x01, // HEADERS
+            0x05, // END_STREAM | END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        frame.extend_from_slice(&hpack);
+
+        tls.write_all(&frame).await.unwrap();
+
+        // Read server response / frame (e.g., SETTINGS frame or stream reset)
+        let mut buf = [0u8; 256];
+        let _ = timeout(Duration::from_millis(100), tls.read(&mut buf)).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            1,
+            "permit must stay 1 while h2 connection is open even after request with Upgrade headers"
+        );
+
+        drop(tls);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *limiter.per_ip.lock().unwrap().get(&peer_ip).unwrap_or(&0),
+            0,
+            "permit must return to 0 after h2 connection is closed"
         );
 
         gate_task.abort();
