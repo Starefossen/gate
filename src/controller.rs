@@ -105,6 +105,21 @@ impl State {
 #[derive(Default)]
 struct SecretState {
     pending: Option<Vec<k8s_openapi::api::core::v1::Secret>>,
+    initialized: bool,
+}
+
+fn check_coverage(store: &CertStore) -> Vec<String> {
+    let mut missing = Vec::new();
+    for host in store.allowlist() {
+        if store.resolve(host).is_none() {
+            warn!(
+                host = %host,
+                "allowlisted host has no matching TLS certificate in gate namespace"
+            );
+            missing.push(host.clone());
+        }
+    }
+    missing
 }
 
 impl SecretState {
@@ -112,12 +127,16 @@ impl SecretState {
         &mut self,
         cert_store: &Arc<std::sync::RwLock<CertStore>>,
         event: watcher::Event<k8s_openapi::api::core::v1::Secret>,
-    ) {
+    ) -> Option<Vec<String>> {
         match event {
             watcher::Event::Apply(secret) => {
                 if let Ok(mut store) = cert_store.write() {
                     apply_secret(&mut store, &secret);
+                    if self.initialized {
+                        return Some(check_coverage(&store));
+                    }
                 }
+                None
             }
             watcher::Event::Delete(secret) => {
                 let key = format!(
@@ -127,15 +146,21 @@ impl SecretState {
                 );
                 if let Ok(mut store) = cert_store.write() {
                     store.remove_cert(&key);
+                    if self.initialized {
+                        return Some(check_coverage(&store));
+                    }
                 }
+                None
             }
             watcher::Event::Init => {
                 self.pending = Some(Vec::new());
+                None
             }
             watcher::Event::InitApply(secret) => {
                 if let Some(p) = self.pending.as_mut() {
                     p.push(secret);
                 }
+                None
             }
             watcher::Event::InitDone => {
                 if let Some(secrets) = self.pending.take()
@@ -146,15 +171,12 @@ impl SecretState {
                     for s in &secrets {
                         apply_secret(&mut new_store, s);
                     }
-                    for host in new_store.allowlist() {
-                        if new_store.resolve(host).is_none() {
-                            warn!(
-                                host = %host,
-                                "allowlisted host has no matching TLS certificate in gate namespace"
-                            );
-                        }
-                    }
+                    self.initialized = true;
+                    let missing = check_coverage(&new_store);
                     *store = new_store;
+                    Some(missing)
+                } else {
+                    None
                 }
             }
         }
@@ -214,7 +236,8 @@ async fn update_allowlist(
     states: &[State; 2],
     allowlist: &Allowlist,
     cert_store: &Arc<std::sync::RwLock<CertStore>>,
-) {
+    secrets_initialized: bool,
+) -> Option<Vec<String>> {
     let hosts: HashSet<String> = states.iter().flat_map(State::host_set).collect();
     {
         let mut guard = allowlist.write().await;
@@ -225,15 +248,11 @@ async fn update_allowlist(
     }
     if let Ok(mut store) = cert_store.write() {
         store.set_allowlist(hosts.clone());
-        for host in &hosts {
-            if store.resolve(host).is_none() {
-                warn!(
-                    host = %host,
-                    "allowlisted host has no matching TLS certificate in gate namespace"
-                );
-            }
+        if secrets_initialized {
+            return Some(check_coverage(&store));
         }
     }
+    None
 }
 
 /// Watches Knative Services, DomainMappings, and namespaced TLS Secrets in gate namespace.
@@ -285,12 +304,14 @@ pub async fn run(
         match event {
             ControllerEvent::Service(e) => {
                 if states[0].apply(e) {
-                    update_allowlist(&states, &allowlist, &cert_store).await;
+                    update_allowlist(&states, &allowlist, &cert_store, secret_state.initialized)
+                        .await;
                 }
             }
             ControllerEvent::DomainMapping(e) => {
                 if states[1].apply(e) {
-                    update_allowlist(&states, &allowlist, &cert_store).await;
+                    update_allowlist(&states, &allowlist, &cert_store, secret_state.initialized)
+                        .await;
                 }
             }
             ControllerEvent::Secret(e) => {
@@ -665,6 +686,67 @@ mod tests {
                 .unwrap()
                 .resolve("b.fn.flaatten.org")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spurious_missing_cert_warning_suppressed_until_init_done() {
+        let cert_store = Arc::new(std::sync::RwLock::new(CertStore::new()));
+        let allowlist: Allowlist = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+        let mut states = [State::default(), State::default()];
+        let mut secret_state = SecretState::default();
+
+        // 1. Service discovered at startup before secret watch finishes initial sync
+        assert!(states[0].apply(watcher::Event::Apply(exposed())));
+        assert!(!secret_state.initialized);
+
+        // Allowlist update before InitDone must NOT check coverage
+        let missing =
+            update_allowlist(&states, &allowlist, &cert_store, secret_state.initialized).await;
+        assert_eq!(
+            missing, None,
+            "coverage must not be checked before secret watch reaches InitDone"
+        );
+        assert!(allowlist.read().await.contains(HOST));
+
+        // 2. Secret watch streams initial list
+        let secret = make_tls_secret("cert-hello", "gate", HOST);
+        secret_state.apply(&cert_store, watcher::Event::Init);
+        secret_state.apply(&cert_store, watcher::Event::InitApply(secret));
+
+        // 3. Secret watch completes initial list: InitDone
+        let missing = secret_state.apply(&cert_store, watcher::Event::InitDone);
+        assert!(secret_state.initialized);
+        assert_eq!(
+            missing,
+            Some(vec![]),
+            "InitDone must check coverage, finding cert matches host"
+        );
+
+        // 4. Later allowlist change after InitDone checks coverage
+        states[1].apply(watcher::Event::Apply(make_service(
+            "uncovered",
+            "ns",
+            expose_annotation(),
+            Some("https://uncovered.fn.flaatten.org"),
+        )));
+        let missing =
+            update_allowlist(&states, &allowlist, &cert_store, secret_state.initialized).await;
+        assert_eq!(
+            missing,
+            Some(vec!["uncovered.fn.flaatten.org".to_string()]),
+            "later allowlist change must check coverage"
+        );
+
+        // 5. Later secret change (delete) after InitDone checks coverage
+        let secret = make_tls_secret("cert-hello", "gate", HOST);
+        let missing = secret_state.apply(&cert_store, watcher::Event::Delete(secret));
+        assert!(
+            missing
+                .as_ref()
+                .map(|m| m.contains(&HOST.to_string()))
+                .unwrap_or(false),
+            "later secret change must check coverage"
         );
     }
 }
