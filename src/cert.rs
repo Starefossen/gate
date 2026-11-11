@@ -36,6 +36,10 @@ impl CertStore {
         self.allowlist = allowed;
     }
 
+    pub fn allowlist(&self) -> &HashSet<String> {
+        &self.allowlist
+    }
+
     pub fn add_cert(
         &mut self,
         secret_key: &str,

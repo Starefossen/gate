@@ -102,6 +102,65 @@ impl State {
     }
 }
 
+#[derive(Default)]
+struct SecretState {
+    pending: Option<Vec<k8s_openapi::api::core::v1::Secret>>,
+}
+
+impl SecretState {
+    fn apply(
+        &mut self,
+        cert_store: &Arc<std::sync::RwLock<CertStore>>,
+        event: watcher::Event<k8s_openapi::api::core::v1::Secret>,
+    ) {
+        match event {
+            watcher::Event::Apply(secret) => {
+                if let Ok(mut store) = cert_store.write() {
+                    apply_secret(&mut store, &secret);
+                }
+            }
+            watcher::Event::Delete(secret) => {
+                let key = format!(
+                    "{}/{}",
+                    secret.metadata.namespace.as_deref().unwrap_or(""),
+                    secret.metadata.name.as_deref().unwrap_or("")
+                );
+                if let Ok(mut store) = cert_store.write() {
+                    store.remove_cert(&key);
+                }
+            }
+            watcher::Event::Init => {
+                self.pending = Some(Vec::new());
+            }
+            watcher::Event::InitApply(secret) => {
+                if let Some(p) = self.pending.as_mut() {
+                    p.push(secret);
+                }
+            }
+            watcher::Event::InitDone => {
+                if let Some(secrets) = self.pending.take()
+                    && let Ok(mut store) = cert_store.write()
+                {
+                    let mut new_store = CertStore::new();
+                    new_store.set_allowlist(store.allowlist().clone());
+                    for s in &secrets {
+                        apply_secret(&mut new_store, s);
+                    }
+                    for host in new_store.allowlist() {
+                        if new_store.resolve(host).is_none() {
+                            warn!(
+                                host = %host,
+                                "allowlisted host has no matching TLS certificate in gate namespace"
+                            );
+                        }
+                    }
+                    *store = new_store;
+                }
+            }
+        }
+    }
+}
+
 enum ControllerEvent {
     Service(watcher::Event<DynamicObject>),
     DomainMapping(watcher::Event<DynamicObject>),
@@ -212,6 +271,7 @@ pub async fn run(
     tokio::pin!(stream);
 
     let mut states = [State::default(), State::default()];
+    let mut secret_state = SecretState::default();
 
     while let Some(item) = stream.next().await {
         let event = match item {
@@ -233,24 +293,9 @@ pub async fn run(
                     update_allowlist(&states, &allowlist, &cert_store).await;
                 }
             }
-            ControllerEvent::Secret(e) => match e {
-                watcher::Event::Apply(secret) | watcher::Event::InitApply(secret) => {
-                    if let Ok(mut store) = cert_store.write() {
-                        apply_secret(&mut store, &secret);
-                    }
-                }
-                watcher::Event::Delete(secret) => {
-                    let key = format!(
-                        "{}/{}",
-                        secret.metadata.namespace.as_deref().unwrap_or(""),
-                        secret.metadata.name.as_deref().unwrap_or("")
-                    );
-                    if let Ok(mut store) = cert_store.write() {
-                        store.remove_cert(&key);
-                    }
-                }
-                _ => {}
-            },
+            ControllerEvent::Secret(e) => {
+                secret_state.apply(&cert_store, e);
+            }
         }
     }
 
@@ -530,5 +575,96 @@ mod tests {
         let mut store = CertStore::new();
         apply_secret(&mut store, &secret);
         assert!(store.resolve("hello.fn.flaatten.org").is_none());
+    }
+
+    fn make_tls_secret(
+        name: &str,
+        namespace: &str,
+        dns_name: &str,
+    ) -> k8s_openapi::api::core::v1::Secret {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from(dns_name).unwrap(),
+        )];
+        let cert = params.self_signed(&key).unwrap();
+
+        let mut data = BTreeMap::new();
+        data.insert(
+            "tls.crt".into(),
+            k8s_openapi::ByteString(cert.pem().into_bytes()),
+        );
+        data.insert(
+            "tls.key".into(),
+            k8s_openapi::ByteString(key.serialize_pem().into_bytes()),
+        );
+
+        k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/tls".into()),
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_secret_relist_drops_secrets_deleted_while_disconnected() {
+        let secret_a = make_tls_secret("cert-a", "gate", "a.fn.flaatten.org");
+        let secret_b = make_tls_secret("cert-b", "gate", "b.fn.flaatten.org");
+
+        let cert_store = Arc::new(std::sync::RwLock::new(CertStore::new()));
+        let mut state = SecretState::default();
+
+        state.apply(&cert_store, watcher::Event::Apply(secret_a));
+        assert!(
+            cert_store
+                .read()
+                .unwrap()
+                .resolve("a.fn.flaatten.org")
+                .is_some()
+        );
+
+        // Watch gap begins: Init
+        state.apply(&cert_store, watcher::Event::Init);
+        state.apply(&cert_store, watcher::Event::InitApply(secret_b));
+
+        // Prior state preserved until InitDone
+        assert!(
+            cert_store
+                .read()
+                .unwrap()
+                .resolve("a.fn.flaatten.org")
+                .is_some()
+        );
+        assert!(
+            cert_store
+                .read()
+                .unwrap()
+                .resolve("b.fn.flaatten.org")
+                .is_none()
+        );
+
+        // Watch gap ends: InitDone
+        state.apply(&cert_store, watcher::Event::InitDone);
+
+        // a was deleted during gap, b is now present
+        assert!(
+            cert_store
+                .read()
+                .unwrap()
+                .resolve("a.fn.flaatten.org")
+                .is_none()
+        );
+        assert!(
+            cert_store
+                .read()
+                .unwrap()
+                .resolve("b.fn.flaatten.org")
+                .is_some()
+        );
     }
 }

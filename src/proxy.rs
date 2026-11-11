@@ -1,10 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,7 +10,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode, header};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
@@ -33,7 +30,6 @@ pub struct ProxyOptions {
     pub header_read_timeout: Duration,
     pub h2_keep_alive_interval: Duration,
     pub h2_keep_alive_timeout: Duration,
-    pub idle_timeout: Duration,
 }
 
 impl Default for ProxyOptions {
@@ -44,87 +40,7 @@ impl Default for ProxyOptions {
             header_read_timeout: Duration::from_secs(15),
             h2_keep_alive_interval: Duration::from_secs(30),
             h2_keep_alive_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
         }
-    }
-}
-
-pub struct IdleStream<T> {
-    inner: T,
-    timeout: Duration,
-    sleep: Pin<Box<tokio::time::Sleep>>,
-}
-
-impl<T> IdleStream<T> {
-    pub fn new(inner: T, timeout: Duration) -> Self {
-        Self {
-            inner,
-            timeout,
-            sleep: Box::pin(tokio::time::sleep(timeout)),
-        }
-    }
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for IdleStream<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.sleep.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "idle connection timeout",
-            )));
-        }
-
-        let before = buf.filled().len();
-        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &res
-            && buf.filled().len() > before
-        {
-            let deadline = tokio::time::Instant::now() + self.timeout;
-            self.sleep.as_mut().reset(deadline);
-        }
-        res
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for IdleStream<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.sleep.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "idle connection timeout",
-            )));
-        }
-
-        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &res
-            && *n > 0
-        {
-            let deadline = tokio::time::Instant::now() + self.timeout;
-            self.sleep.as_mut().reset(deadline);
-        }
-        res
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.sleep.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "idle connection timeout",
-            )));
-        }
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -318,20 +234,9 @@ async fn handle_tls_connection(
         }
     };
     let negotiated_sni = Arc::new(sni);
+    let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
 
-    let idle_stream = IdleStream::new(tls_stream, options.idle_timeout);
-    let io = TokioIo::new(idle_stream);
-    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(options.header_read_timeout);
-    builder
-        .http2()
-        .timer(TokioTimer::new())
-        .keep_alive_interval(options.h2_keep_alive_interval)
-        .keep_alive_timeout(options.h2_keep_alive_timeout);
-
+    let io = TokioIo::new(tls_stream);
     let service = hyper::service::service_fn({
         let negotiated_sni = negotiated_sni.clone();
         let allowlist = allowlist.clone();
@@ -346,7 +251,23 @@ async fn handle_tls_connection(
         }
     });
 
-    let _ = builder.serve_connection_with_upgrades(io, service).await;
+    // ALPN already chose the protocol. hyper-util's auto builder would sniff
+    // the first bytes with no timeout, letting an idle client hold its permit.
+    if is_h2 {
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .keep_alive_interval(options.h2_keep_alive_interval)
+            .keep_alive_timeout(options.h2_keep_alive_timeout)
+            .serve_connection(io, service)
+            .await;
+    } else {
+        let _ = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(options.header_read_timeout)
+            .serve_connection(io, service)
+            .with_upgrades()
+            .await;
+    }
     Ok(())
 }
 
@@ -443,6 +364,7 @@ async fn handle_http_request(
     }
 
     let (mut parts, body) = req.into_parts();
+    parts.version = hyper::Version::HTTP_11;
     parts.uri = outgoing_uri;
 
     for h in &headers_to_remove {
@@ -1223,6 +1145,9 @@ mod tests {
         let mut test_client_config = rustls::ClientConfig::builder()
             .with_root_certificates(test_client_roots)
             .with_no_client_auth();
+        let mut h1_client_config = test_client_config.clone();
+        h1_client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let h1_connector = tokio_rustls::TlsConnector::from(Arc::new(h1_client_config));
         test_client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let client_connector = tokio_rustls::TlsConnector::from(Arc::new(test_client_config));
 
@@ -1235,7 +1160,7 @@ mod tests {
             let tcp = TcpStream::connect(gate_addr).await.unwrap();
             let server_name =
                 rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
-            let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+            let mut tls = h1_connector.connect(server_name, tcp).await.unwrap();
 
             let request =
                 b"GET /secret HTTP/1.1\r\nHost: fronted.example.com\r\nConnection: close\r\n\r\n";
@@ -1258,7 +1183,7 @@ mod tests {
             let tcp = TcpStream::connect(gate_addr).await.unwrap();
             let server_name =
                 rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
-            let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+            let mut tls = h1_connector.connect(server_name, tcp).await.unwrap();
 
             let request =
                 b"GET https://fronted.example.com/secret HTTP/1.1\r\nHost: allowed.example.com\r\nConnection: close\r\n\r\n";
@@ -1310,7 +1235,7 @@ mod tests {
             let tcp = TcpStream::connect(gate_addr).await.unwrap();
             let server_name =
                 rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
-            let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+            let mut tls = h1_connector.connect(server_name, tcp).await.unwrap();
 
             let request =
                 b"GET /test HTTP/1.1\r\nHost: allowed.example.com:8443\r\nConnection: close\r\n\r\n";
@@ -1386,10 +1311,11 @@ mod tests {
         drop(gate_listener);
 
         let limiter = ConnLimiter::new(10, 10);
-        let mut options = ProxyOptions::default();
-        options.upstream_tls_config = upstream_tls_config;
-        options.idle_timeout = Duration::from_millis(150);
-        options.header_read_timeout = Duration::from_millis(150);
+        let options = ProxyOptions {
+            upstream_tls_config,
+            header_read_timeout: Duration::from_millis(150),
+            ..ProxyOptions::default()
+        };
 
         let gate_task = tokio::spawn(run_tls_proxy_with_options(
             gate_addr.to_string(),
@@ -1659,6 +1585,264 @@ mod tests {
         let res = String::from_utf8_lossy(&buf[..n]);
         assert!(res.starts_with("HTTP/1.1 200 OK"), "got: {res}");
         assert!(res.contains("sanitized ok"));
+
+        gate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_h1_request_with_upstream_delay_succeeds() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("allowed.example.com").unwrap(),
+        )];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let mut upstream_server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    server_cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+            )
+            .unwrap();
+        upstream_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let upstream_acceptor = TlsAcceptor::from(Arc::new(upstream_server_config));
+
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let tls_stream = upstream_acceptor.accept(stream).await.unwrap();
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(|_req: Request<Incoming>| async move {
+                // Delay longer than gate's header_read_timeout (100ms)
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let body = Full::new(Bytes::from("delayed upstream ok\n"))
+                    .map_err(|e| match e {})
+                    .boxed();
+                Ok::<_, hyper::Error>(Response::builder().status(200).body(body).unwrap())
+            });
+            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            let _ = builder.serve_connection(io, service).await;
+        });
+
+        let mut cert_store = cert::CertStore::new();
+        cert_store.set_allowlist(HashSet::from(["allowed.example.com".to_string()]));
+        cert_store
+            .add_cert(
+                "default/allowed",
+                server_cert.pem().as_bytes(),
+                server_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        let cert_store = Arc::new(std::sync::RwLock::new(cert_store));
+        let allowlist = make_allowlist(vec!["allowed.example.com"]);
+        let cert_resolver = Arc::new(DynamicCertResolver::new(cert_store, allowlist.clone()));
+
+        let mut client_root_store = rustls::RootCertStore::empty();
+        client_root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+        let upstream_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store.clone())
+                .with_no_client_auth(),
+        );
+
+        let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_addr = gate_listener.local_addr().unwrap();
+        drop(gate_listener);
+
+        let limiter = ConnLimiter::new(10, 10);
+        let options = ProxyOptions {
+            upstream_tls_config,
+            header_read_timeout: Duration::from_millis(100),
+            ..ProxyOptions::default()
+        };
+
+        let gate_task = tokio::spawn(run_tls_proxy_with_options(
+            gate_addr.to_string(),
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            allowlist,
+            cert_resolver,
+            limiter,
+            options,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let test_client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store)
+                .with_no_client_auth(),
+        );
+        let client_connector = tokio_rustls::TlsConnector::from(test_client_config);
+
+        let tcp = TcpStream::connect(gate_addr).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
+        let mut tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        let request =
+            b"GET /delayed HTTP/1.1\r\nHost: allowed.example.com\r\nConnection: close\r\n\r\n";
+        tls.write_all(request).await.unwrap();
+
+        let mut response = String::new();
+        tls.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "expected 200 OK for delayed response, got: {response}"
+        );
+        assert!(response.contains("delayed upstream ok"));
+
+        gate_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_h2_client_forwarding() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.subject_alt_names = vec![rcgen::SanType::DnsName(
+            rcgen::Ia5String::try_from("allowed.example.com").unwrap(),
+        )];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let mut upstream_server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    server_cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+            )
+            .unwrap();
+        upstream_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let upstream_acceptor = TlsAcceptor::from(Arc::new(upstream_server_config));
+
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let tls_stream = upstream_acceptor.accept(stream).await.unwrap();
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                // Downstream h2 request MUST be forwarded as HTTP/1.1 to upstream
+                assert_eq!(req.version(), hyper::Version::HTTP_11);
+
+                // Downstream :authority MUST become Host header upstream
+                let host = req
+                    .headers()
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                assert_eq!(host, "allowed.example.com");
+
+                let body = Full::new(Bytes::from("h2 to h1 upstream ok\n"))
+                    .map_err(|e| match e {})
+                    .boxed();
+                Ok::<_, hyper::Error>(Response::builder().status(200).body(body).unwrap())
+            });
+            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            let _ = builder.serve_connection(io, service).await;
+        });
+
+        let mut cert_store = cert::CertStore::new();
+        cert_store.set_allowlist(HashSet::from(["allowed.example.com".to_string()]));
+        cert_store
+            .add_cert(
+                "default/allowed",
+                server_cert.pem().as_bytes(),
+                server_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+        let cert_store = Arc::new(std::sync::RwLock::new(cert_store));
+        let allowlist = make_allowlist(vec!["allowed.example.com"]);
+        let cert_resolver = Arc::new(DynamicCertResolver::new(cert_store, allowlist.clone()));
+
+        let mut client_root_store = rustls::RootCertStore::empty();
+        client_root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+        let upstream_tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(client_root_store.clone())
+                .with_no_client_auth(),
+        );
+
+        let gate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_addr = gate_listener.local_addr().unwrap();
+        drop(gate_listener);
+
+        let limiter = ConnLimiter::new(10, 10);
+        let gate_task = tokio::spawn(run_tls_proxy_with_config(
+            gate_addr.to_string(),
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            allowlist,
+            cert_resolver,
+            limiter,
+            upstream_tls_config,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut test_client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(client_root_store)
+            .with_no_client_auth();
+        test_client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let client_connector = tokio_rustls::TlsConnector::from(Arc::new(test_client_config));
+
+        let tcp = TcpStream::connect(gate_addr).await.unwrap();
+        let server_name =
+            rustls::pki_types::ServerName::try_from("allowed.example.com".to_string()).unwrap();
+        let tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        // Verify ALPN h2 negotiated
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+
+        let (mut client, h2_conn) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        // Request without explicit Host header, only :authority
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri("https://allowed.example.com/test-h2")
+            .body(())
+            .unwrap();
+        let (res_fut, _) = client.send_request(req, true).unwrap();
+        let mut res = res_fut.await.unwrap();
+        assert_eq!(res.status(), hyper::StatusCode::OK);
+
+        let mut body = Vec::new();
+        while let Some(chunk) = res.body_mut().data().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"h2 to h1 upstream ok\n");
 
         gate_task.abort();
     }
