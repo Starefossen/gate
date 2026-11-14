@@ -10,6 +10,10 @@ description = "Build binaries and Docker image"
 run = """
   mkdir -p binaries
 
+  command -v rustup >/dev/null || { echo "rustup is required (Homebrew rust lacks the linux target): https://rustup.rs" >&2; exit 1; }
+  export PATH="$(dirname "$(rustup which cargo)"):$PATH"
+  rustup target add x86_64-unknown-linux-gnu >/dev/null
+
   echo "Building linux/amd64..."
   cargo zigbuild --release --target x86_64-unknown-linux-gnu
   cp target/x86_64-unknown-linux-gnu/release/gate binaries/gate-linux-amd64
