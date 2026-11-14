@@ -40,20 +40,30 @@ async fn main() {
         env_usize("MAX_CONN_PER_IP", 50).max(1),
     );
 
-    let tls_proxy = proxy::run_tls_proxy(
+    let options = proxy::ProxyOptions {
+        hsts: proxy::hsts_header(env_usize("HSTS_MAX_AGE", 86_400) as u64),
+        ..proxy::ProxyOptions::default()
+    };
+    let tls_proxy = proxy::run_tls_proxy_with_options(
         tls_listen,
         upstream_host.clone(),
         upstream_port,
         allowlist.clone(),
         cert_resolver,
         limiter.clone(),
+        options,
     );
 
     let http_proxy = proxy::run_http_redirect(http_listen, allowlist.clone(), limiter);
 
-    let health = proxy::run_health_server(health_listen);
+    let sync = Arc::new(controller::SyncStatus::default());
+    let health = proxy::run_health_server(
+        health_listen,
+        sync.clone(),
+        std::time::Duration::from_secs(env_usize("SYNC_STALE_SECS", 300) as u64),
+    );
 
-    let controller = controller::run(allowlist.clone(), cert_store.clone());
+    let controller = controller::run(allowlist.clone(), cert_store.clone(), sync);
 
     tokio::select! {
         r = tls_proxy => { if let Err(e) = r { tracing::error!(error = %e, "tls proxy exited"); } }

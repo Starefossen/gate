@@ -35,6 +35,12 @@ pub struct ProxyOptions {
     pub h2_keep_alive_interval: Duration,
     pub h2_keep_alive_timeout: Duration,
     pub tunnel_idle_timeout: Duration,
+    pub h2_max_concurrent_streams: u32,
+    /// Close h2 connections that have had no open streams for this long.
+    pub h2_idle_timeout: Duration,
+    /// Deadline for upstream response headers (covers slow request bodies).
+    pub request_timeout: Duration,
+    pub hsts: Option<header::HeaderValue>,
 }
 
 impl Default for ProxyOptions {
@@ -46,6 +52,10 @@ impl Default for ProxyOptions {
             h2_keep_alive_interval: Duration::from_secs(30),
             h2_keep_alive_timeout: Duration::from_secs(10),
             tunnel_idle_timeout: Duration::from_secs(10 * 60),
+            h2_max_concurrent_streams: 32,
+            h2_idle_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(120),
+            hsts: hsts_header(86_400),
         }
     }
 }
@@ -145,6 +155,41 @@ impl Drop for ConnPermit {
                 map.remove(&self.ip);
             }
         }
+    }
+}
+
+/// `max-age=N` without includeSubDomains or preload; 0 disables.
+pub fn hsts_header(max_age: u64) -> Option<header::HeaderValue> {
+    (max_age > 0).then(|| header::HeaderValue::from_str(&format!("max-age={max_age}")).unwrap())
+}
+
+/// Counts in-flight requests on one connection. A guard lives until the
+/// response body is done or dropped.
+#[derive(Clone, Default)]
+struct StreamTracker {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct StreamGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl StreamTracker {
+    fn start(&self) -> StreamGuard {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.started.fetch_add(1, Relaxed);
+        self.active.fetch_add(1, Relaxed);
+        StreamGuard(self.active.clone())
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.active.load(Relaxed), self.started.load(Relaxed))
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -289,6 +334,7 @@ async fn handle_tls_connection(
     };
     let negotiated_sni = Arc::new(sni);
     let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+    let tracker = StreamTracker::default();
 
     let service = hyper::service::service_fn({
         let negotiated_sni = negotiated_sni.clone();
@@ -296,14 +342,16 @@ async fn handle_tls_connection(
         let upstream_client = upstream_client.clone();
         let permit = permit.clone();
         let options = options.clone();
+        let tracker = tracker.clone();
         move |req: Request<Incoming>| {
+            let guard = tracker.start();
             let negotiated_sni = negotiated_sni.clone();
             let allowlist = allowlist.clone();
             let upstream_client = upstream_client.clone();
             let permit = permit.clone();
             let options = options.clone();
             async move {
-                handle_http_request(
+                let res = handle_http_request(
                     req,
                     peer,
                     &negotiated_sni,
@@ -312,7 +360,15 @@ async fn handle_tls_connection(
                     permit,
                     &options,
                 )
-                .await
+                .await?;
+                let (parts, body) = res.into_parts();
+                let body = body
+                    .map_frame(move |f| {
+                        let _ = &guard;
+                        f
+                    })
+                    .boxed();
+                Ok::<_, hyper::Error>(Response::from_parts(parts, body))
             }
         }
     });
@@ -338,12 +394,33 @@ async fn handle_tls_connection(
         }
         let (rd, wr) = tokio::io::split(tls_stream);
         let io = TokioIo::new(tokio::io::join(std::io::Cursor::new(preface).chain(rd), wr));
-        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
             .keep_alive_interval(options.h2_keep_alive_interval)
             .keep_alive_timeout(options.h2_keep_alive_timeout)
-            .serve_connection(io, service)
-            .await;
+            .max_concurrent_streams(options.h2_max_concurrent_streams)
+            .serve_connection(io, service);
+        tokio::pin!(conn);
+        let mut tick = tokio::time::interval(options.h2_idle_timeout);
+        tick.tick().await;
+        let mut last = tracker.snapshot();
+        let mut shutting_down = false;
+        loop {
+            tokio::select! {
+                _ = conn.as_mut() => break,
+                _ = tick.tick(), if !shutting_down => {
+                    let now = tracker.snapshot();
+                    // ponytail: one-tick granularity, so an idle conn lives
+                    // between 1x and 2x h2_idle_timeout.
+                    if now.0 == 0 && now == last {
+                        debug!(peer = %peer, "h2 connection idle, closing");
+                        conn.as_mut().graceful_shutdown();
+                        shutting_down = true;
+                    }
+                    last = now;
+                }
+            }
+        }
     } else {
         let io = TokioIo::new(tls_stream);
         let _ = hyper::server::conn::http1::Builder::new()
@@ -401,11 +478,10 @@ async fn handle_http_request(
         }
     }
 
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let Some(path_and_query) = origin_path(&req) else {
+        debug!(peer = %peer, "request target is not origin-form, rejecting with 400");
+        return Ok(bad_request_response());
+    };
 
     let outgoing_uri =
         match format!("https://{effective_host}{path_and_query}").parse::<hyper::Uri>() {
@@ -509,13 +585,29 @@ async fn handle_http_request(
 
     let outgoing_req = Request::from_parts(parts, body);
 
-    let mut upstream_res = match upstream_client.request(outgoing_req).await {
-        Ok(res) => res,
-        Err(e) => {
+    let mut upstream_res = match timeout(
+        options.request_timeout,
+        upstream_client.request(outgoing_req),
+    )
+    .await
+    {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => {
             debug!(peer = %peer, error = %e, "upstream request error");
             return Ok(bad_gateway_response());
         }
+        Err(_) => {
+            debug!(peer = %peer, "upstream request timed out");
+            return Ok(gateway_timeout_response());
+        }
     };
+
+    if let Some(hsts) = &options.hsts {
+        upstream_res
+            .headers_mut()
+            .entry(header::STRICT_TRANSPORT_SECURITY)
+            .or_insert_with(|| hsts.clone());
+    }
 
     if upstream_res.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(client_fut) = client_upgrade
@@ -601,6 +693,26 @@ fn bad_request_response() -> Response<BoxBody<Bytes, hyper::Error>> {
         .status(StatusCode::BAD_REQUEST)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::CONTENT_LENGTH, "16")
+        .header(header::CONNECTION, "close")
+        .body(body)
+        .unwrap()
+}
+
+/// Origin-form path and query ("/..."). Anything else (userinfo-looking
+/// "x@host/", asterisk-form) would be spliced into the upstream authority.
+fn origin_path<B>(req: &Request<B>) -> Option<&str> {
+    let pq = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    pq.starts_with('/').then_some(pq)
+}
+
+fn gateway_timeout_response() -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = Full::new(Bytes::from("504 Gateway Timeout\n"))
+        .map_err(|e| match e {})
+        .boxed();
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, "20")
         .header(header::CONNECTION, "close")
         .body(body)
         .unwrap()
@@ -755,16 +867,28 @@ fn extract_http_host(data: &[u8]) -> Option<String> {
     None
 }
 
-pub async fn run_health_server(listen_addr: String) -> io::Result<()> {
+/// `/` is liveness and always 200. `/ready` returns 503 once the controller
+/// has gone `max_stale` without a successful watch event.
+pub async fn run_health_server(
+    listen_addr: String,
+    sync: Arc<crate::controller::SyncStatus>,
+    max_stale: Duration,
+) -> io::Result<()> {
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(addr = listen_addr, "health server listening");
 
     loop {
         let (mut stream, _) = listener.accept().await?;
+        let sync = sync.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1024];
-            let _ = stream.read(&mut buf).await;
-            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let ready_req = buf[..n].starts_with(b"GET /ready ");
+            let response: &[u8] = if ready_req && sync.is_stale(max_stale) {
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n\r\nstale"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            };
             let _ = stream.write_all(response).await;
         });
     }
@@ -774,6 +898,28 @@ pub async fn run_health_server(listen_addr: String) -> io::Result<()> {
 mod tests {
     use super::*;
     use http_body_util::Empty;
+
+    #[test]
+    fn origin_path_rejects_non_origin_targets() {
+        let req = |pq: &str| {
+            let uri = hyper::Uri::builder()
+                .scheme("https")
+                .authority("a.example")
+                .path_and_query(pq)
+                .build()
+                .unwrap();
+            Request::builder().uri(uri).body(()).unwrap()
+        };
+        assert_eq!(origin_path(&req("/x?y=1")), Some("/x?y=1"));
+        assert_eq!(origin_path(&req("x@internal.host/")), None);
+        assert_eq!(origin_path(&req("*")), None);
+    }
+
+    #[test]
+    fn hsts_header_values() {
+        assert_eq!(hsts_header(0), None);
+        assert_eq!(hsts_header(86_400).unwrap(), "max-age=86400");
+    }
 
     // =========================================================
     // Unit tests: Host/SNI normalization & extraction (Req 6)

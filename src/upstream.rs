@@ -109,5 +109,6 @@ where
     let connector = UpstreamConnector::new(upstream_target, TlsConnector::from(tls_config));
     hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(32)
         .build(connector)
 }

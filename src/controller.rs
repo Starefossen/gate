@@ -11,6 +11,41 @@ use crate::cert::CertStore;
 
 const ANNOTATION_KEY: &str = "gate.flaatten.org/expose";
 
+/// Watch health: when the watch streams have been failing (or not yet
+/// connected) for too long, the allowlist may be stale and gate stops
+/// reporting ready.
+pub struct SyncStatus {
+    failing_since: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl Default for SyncStatus {
+    fn default() -> Self {
+        Self {
+            failing_since: std::sync::Mutex::new(Some(std::time::Instant::now())),
+        }
+    }
+}
+
+impl SyncStatus {
+    pub fn ok(&self) {
+        *self.failing_since.lock().unwrap() = None;
+    }
+
+    pub fn err(&self) {
+        self.failing_since
+            .lock()
+            .unwrap()
+            .get_or_insert_with(std::time::Instant::now);
+    }
+
+    pub fn is_stale(&self, max: std::time::Duration) -> bool {
+        self.failing_since
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() > max)
+    }
+}
+
 /// Check whether a Knative Service has the expose annotation set to "true".
 fn is_exposed(svc: &DynamicObject) -> bool {
     svc.metadata
@@ -260,6 +295,7 @@ async fn update_allowlist(
 pub async fn run(
     allowlist: Allowlist,
     cert_store: Arc<std::sync::RwLock<CertStore>>,
+    sync: Arc<SyncStatus>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
     let gate_ns = std::env::var("GATE_NAMESPACE").unwrap_or_else(|_| "gate".to_string());
@@ -294,8 +330,12 @@ pub async fn run(
 
     while let Some(item) = stream.next().await {
         let event = match item {
-            Ok(e) => e,
+            Ok(e) => {
+                sync.ok();
+                e
+            }
             Err(err) => {
+                sync.err();
                 warn!(error = %err, "watcher error, continuing with backoff");
                 continue;
             }
@@ -331,6 +371,22 @@ mod tests {
     use kube::api::ObjectMeta;
 
     use super::*;
+
+    #[test]
+    fn sync_status_goes_stale_and_recovers() {
+        let s = SyncStatus::default();
+        assert!(!s.is_stale(std::time::Duration::from_secs(60)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(s.is_stale(std::time::Duration::from_millis(1)));
+        s.ok();
+        assert!(!s.is_stale(std::time::Duration::ZERO));
+        s.err();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(s.is_stale(std::time::Duration::from_millis(1)));
+        assert!(!s.is_stale(std::time::Duration::from_secs(60)));
+        s.ok();
+        assert!(!s.is_stale(std::time::Duration::from_millis(1)));
+    }
 
     fn make_service(
         name: &str,
