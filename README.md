@@ -37,6 +37,16 @@ Internet → [Gate :443] ──── TLS termination ────→ [Kourier/E
 6. Incoming plain HTTP connections (:80) are never forwarded: allowlisted hosts
    get a 301 to `https://<host><path>`, non-matching traffic gets 403
 
+Details (moved from the home repo's RFC 001 and `AGENTS.md`):
+
+- Gate binds `0.0.0.0:8443` and terminates every connection with `rustls`.
+- In HTTP/2 a client can reuse one connection across co-hosted exposed domains;
+  a fronted stream is reset without breaking the connection.
+- Upstream is `https://kourier.kourier-system.svc:443`, with the upstream SNI set
+  to the validated host. The Kourier hop costs about 1–3 ms.
+- LAN clients still resolve `*.fn.flaatten.org` to Kourier directly, so gate
+  needs no split DNS or firewall change. Gate uses about 20–30 MiB RAM.
+
 ## Configuration
 
 | Variable        | Default                      | Description                   |
