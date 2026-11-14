@@ -48,7 +48,13 @@ Internet → [Gate :443] ──── TLS termination ────→ [Kourier/E
 | `MAX_CONN`      | `256`                        | Global concurrent connection cap (sized for 128Mi memory limit) |
 | `MAX_CONN_PER_IP` | `50`                       | Per-client-IP concurrent connection cap |
 | `HEALTH_LISTEN` | `0.0.0.0:9090`               | Health check endpoint         |
+| `REQUEST_TIMEOUT_SECS` | `120`                 | Deadline for upstream response headers, counted from when the request is forwarded. Includes the time the client spends sending the request body |
 | `RUST_LOG`      | `gate=info`                  | Log level filter              |
+
+`REQUEST_TIMEOUT_SECS` caps how long an upload may take: a request whose body is
+still being sent when the deadline passes is aborted with 504. Raise it before
+exposing an app that accepts large uploads (size it for the largest file over the
+slowest expected uplink), and keep it at or below the Knative revision timeout.
 
 ## Exposing a Service
 

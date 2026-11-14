@@ -11,38 +11,42 @@ use crate::cert::CertStore;
 
 const ANNOTATION_KEY: &str = "gate.flaatten.org/expose";
 
-/// Watch health: when the watch streams have been failing (or not yet
-/// connected) for too long, the allowlist may be stale and gate stops
-/// reporting ready.
+/// Watch health, tracked per watcher (services, domain mappings, secrets).
+/// When any one of them has been failing (or not yet connected) for too long,
+/// the allowlist or cert store may be stale and gate stops reporting ready.
+/// One watcher's events never clear another's failure.
 pub struct SyncStatus {
-    failing_since: std::sync::Mutex<Option<std::time::Instant>>,
+    failing_since: std::sync::Mutex<[Option<std::time::Instant>; WATCHERS]>,
 }
+
+const WATCHERS: usize = 3;
+const SERVICES: usize = 0;
+const MAPPINGS: usize = 1;
+const SECRETS: usize = 2;
 
 impl Default for SyncStatus {
     fn default() -> Self {
         Self {
-            failing_since: std::sync::Mutex::new(Some(std::time::Instant::now())),
+            failing_since: std::sync::Mutex::new([Some(std::time::Instant::now()); WATCHERS]),
         }
     }
 }
 
 impl SyncStatus {
-    pub fn ok(&self) {
-        *self.failing_since.lock().unwrap() = None;
+    pub fn ok(&self, watcher: usize) {
+        self.failing_since.lock().unwrap()[watcher] = None;
     }
 
-    pub fn err(&self) {
-        self.failing_since
-            .lock()
-            .unwrap()
-            .get_or_insert_with(std::time::Instant::now);
+    pub fn err(&self, watcher: usize) {
+        self.failing_since.lock().unwrap()[watcher].get_or_insert_with(std::time::Instant::now);
     }
 
     pub fn is_stale(&self, max: std::time::Duration) -> bool {
         self.failing_since
             .lock()
             .unwrap()
-            .is_some_and(|t| t.elapsed() > max)
+            .iter()
+            .any(|t| t.is_some_and(|t| t.elapsed() > max))
     }
 }
 
@@ -224,6 +228,16 @@ enum ControllerEvent {
     Secret(watcher::Event<k8s_openapi::api::core::v1::Secret>),
 }
 
+impl ControllerEvent {
+    fn watcher(&self) -> usize {
+        match self {
+            Self::Service(_) => SERVICES,
+            Self::DomainMapping(_) => MAPPINGS,
+            Self::Secret(_) => SECRETS,
+        }
+    }
+}
+
 fn watch_custom(
     client: kube::Client,
     group: &str,
@@ -306,21 +320,24 @@ pub async fn run(
     );
 
     let services = watch_custom(client.clone(), "serving.knative.dev", "v1", "Service")
-        .map_ok(ControllerEvent::Service);
+        .map_ok(ControllerEvent::Service)
+        .map_err(|e| (SERVICES, e));
     let mappings = watch_custom(
         client.clone(),
         "serving.knative.dev",
         "v1beta1",
         "DomainMapping",
     )
-    .map_ok(ControllerEvent::DomainMapping);
+    .map_ok(ControllerEvent::DomainMapping)
+    .map_err(|e| (MAPPINGS, e));
 
     let secrets_api: Api<k8s_openapi::api::core::v1::Secret> =
         Api::namespaced(client.clone(), &gate_ns);
     let secrets_config = watcher::Config::default().fields("type=kubernetes.io/tls");
     let secrets = watcher(secrets_api, secrets_config)
         .default_backoff()
-        .map_ok(ControllerEvent::Secret);
+        .map_ok(ControllerEvent::Secret)
+        .map_err(|e| (SECRETS, e));
 
     let stream = futures::stream::select(futures::stream::select(services, mappings), secrets);
     tokio::pin!(stream);
@@ -331,12 +348,12 @@ pub async fn run(
     while let Some(item) = stream.next().await {
         let event = match item {
             Ok(e) => {
-                sync.ok();
+                sync.ok(e.watcher());
                 e
             }
-            Err(err) => {
-                sync.err();
-                warn!(error = %err, "watcher error, continuing with backoff");
+            Err((watcher, err)) => {
+                sync.err(watcher);
+                warn!(watcher, error = %err, "watcher error, continuing with backoff");
                 continue;
             }
         };
@@ -374,18 +391,47 @@ mod tests {
 
     #[test]
     fn sync_status_goes_stale_and_recovers() {
+        use std::time::Duration;
+        let all_ok = |s: &SyncStatus| (0..WATCHERS).for_each(|w| s.ok(w));
+
         let s = SyncStatus::default();
-        assert!(!s.is_stale(std::time::Duration::from_secs(60)));
+        assert!(!s.is_stale(Duration::from_secs(60)));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(s.is_stale(Duration::from_millis(1)));
+        all_ok(&s);
+        assert!(!s.is_stale(Duration::ZERO));
+        s.err(SERVICES);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(s.is_stale(Duration::from_millis(1)));
+        assert!(!s.is_stale(Duration::from_secs(60)));
+        s.ok(SERVICES);
+        assert!(!s.is_stale(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn sync_status_is_not_ready_until_every_watcher_connects() {
+        let s = SyncStatus::default();
+        s.ok(SERVICES);
+        s.ok(SECRETS);
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(s.is_stale(std::time::Duration::from_millis(1)));
-        s.ok();
+        s.ok(MAPPINGS);
         assert!(!s.is_stale(std::time::Duration::ZERO));
-        s.err();
+    }
+
+    #[test]
+    fn sync_status_dead_watcher_is_not_hidden_by_others() {
+        let s = SyncStatus::default();
+        (0..WATCHERS).for_each(|w| s.ok(w));
+        s.err(MAPPINGS);
         std::thread::sleep(std::time::Duration::from_millis(5));
+        s.ok(SERVICES);
+        s.ok(SECRETS);
         assert!(s.is_stale(std::time::Duration::from_millis(1)));
-        assert!(!s.is_stale(std::time::Duration::from_secs(60)));
-        s.ok();
-        assert!(!s.is_stale(std::time::Duration::from_millis(1)));
+        s.err(MAPPINGS);
+        assert!(s.is_stale(std::time::Duration::from_millis(1)));
+        s.ok(MAPPINGS);
+        assert!(!s.is_stale(std::time::Duration::ZERO));
     }
 
     fn make_service(

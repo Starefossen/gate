@@ -42,6 +42,9 @@ async fn main() {
 
     let options = proxy::ProxyOptions {
         hsts: proxy::hsts_header(env_usize("HSTS_MAX_AGE", 86_400) as u64),
+        request_timeout: std::time::Duration::from_secs(
+            env_usize("REQUEST_TIMEOUT_SECS", 120).max(1) as u64,
+        ),
         ..proxy::ProxyOptions::default()
     };
     let tls_proxy = proxy::run_tls_proxy_with_options(
